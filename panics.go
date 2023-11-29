@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -16,9 +17,10 @@ import (
 const writeTimeout = 100 * time.Millisecond
 
 var (
-	panicked  atomic.Bool
-	testNoLog atomic.Bool
-	stderr    io.Writer = os.Stderr
+	panicked   atomic.Bool
+	testNoLog  atomic.Bool
+	firstPanic atomic.Pointer[Error]
+	stderr     io.Writer = os.Stderr
 )
 
 // TODO: remove if not used
@@ -105,6 +107,166 @@ func (e *Error) WriteTo(w io.Writer) (int64, error) {
 	return int64(n), err
 }
 
+var handlers struct {
+	sync.Mutex
+	m map[chan<- *Error]struct{}
+}
+
+func notifyLocked(ch chan<- *Error) {
+	if handlers.m == nil {
+		handlers.m = make(map[chan<- *Error]struct{})
+	}
+	handlers.m[ch] = struct{}{}
+}
+
+// TODO: if a panic already occurred should we immediately send it on the channel??
+func Notify(ch chan<- *Error) {
+	if ch == nil {
+		panic("panics: Notify using nil channel")
+	}
+	handlers.Lock()
+	notifyLocked(ch)
+	handlers.Unlock()
+}
+
+func Stop(ch chan<- *Error) {
+	handlers.Lock()
+	delete(handlers.m, ch)
+	handlers.Unlock()
+}
+
+func process(e *Error) {
+	handlers.Lock()
+	defer handlers.Unlock()
+	for c := range handlers.m {
+		// send Error but do not block for it
+		select {
+		case c <- e:
+		default:
+		}
+	}
+	// Wait for all notified Contexts to be cancelled before returning.
+	// Otherwise, Capture can return before any Contexts are cancelled.
+	//
+	// The handlers lock must be held to prevent the WaitGroup from being
+	// incremented by new Contexts that were not signaled.
+	contextWaitGroup.Wait()
+}
+
+// Actually the lock around Notify should prevent this
+//
+// WARN: using this could lead to issues if we call Notify during process()
+var contextWaitGroup sync.WaitGroup
+
+// TODO: note that we set the cancel cause
+func NotifyContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancelCause(parent)
+	c := &panicsCtx{
+		Context: ctx,
+		cancel:  cancel,
+		ch:      make(chan *Error, 1),
+	}
+	// WARN WARN WARN WARN WARN WARN WARN
+	//
+	// I'm not sure we need this - model it out
+	//
+	// 	1. Notify
+	// 	2. panic -> process
+	// 	3. Add()
+	// 	3. goroutine starts
+	// 	3. process (ok)
+	// 	4.
+	//
+	// WARN WARN WARN WARN WARN WARN WARN
+	//
+	// Hold the lock so that the WaitGroup cannot be incremented by while
+	// we're processing a panic.
+	handlers.Lock()
+	defer handlers.Unlock()
+	notifyLocked(c.ch)
+	if ctx.Err() == nil {
+		contextWaitGroup.Add(1)
+		go func() {
+			defer func() {
+				contextWaitGroup.Done()
+				// If we're handling a panic this will be called after
+				// process() exits and releases the handlers lock.
+				// As a result this goroutine may still be briefly alive
+				// after Capture or Go exit.
+				Stop(c.ch)
+			}()
+			select {
+			case e := <-c.ch:
+				c.cancel(e)
+			case <-c.Done():
+			}
+		}()
+	}
+	return c, c.stop
+}
+
+type panicsCtx struct {
+	context.Context
+	cancel context.CancelCauseFunc
+	ch     chan *Error
+}
+
+func (c *panicsCtx) stop() {
+	// handle a race between the user calling stop and a panic being sent
+	select {
+	case e := <-c.ch:
+		c.cancel(e)
+	default:
+		c.cancel(nil)
+	}
+	Stop(c.ch)
+}
+
+// TODO: rename
+func ContextPanicError(ctx context.Context) *Error {
+	if ctx == nil {
+		return nil
+	}
+	e, _ := context.Cause(ctx).(*Error)
+	return e
+}
+
+func (c *panicsCtx) String() string {
+	// We know that the type of c.Context is context.cancelCtx, and we know that the
+	// String method of cancelCtx returns a string that ends with ".WithCancel".
+	name := c.Context.(fmt.Stringer).String()
+	name = name[:len(name)-len(".WithCancel")]
+	return "panics.NotifyContext(" + name + ")"
+}
+
+// WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN
+var (
+	created   atomic.Int64
+	finalized atomic.Int64
+)
+
+// WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN
+//
+// Find a way to make this work without leaking !!!
+// Maybe we can intern the channel ???
+//
+// WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN
+func DoneX() <-chan *Error {
+	c := make(chan *Error, 1)
+	// WARN
+	if e := firstPanic.Load(); e != nil {
+		c <- e
+		return c
+	}
+	Notify(c)
+	created.Add(1)
+	runtime.SetFinalizer(&c, func(c *chan *Error) {
+		finalized.Add(1)
+		Stop(*c)
+	})
+	return c
+}
+
 // Context returns a non-nill [context.Context] that is closed if the program
 // panics. The panic and a stack trace captured at the panic site can be
 // retrieve using [context.Cause] which will return an error with type [*Error].
@@ -177,6 +339,12 @@ func handlePanic(e *Error, timeout time.Duration) {
 	// Delay cancelling the Context until after we've printed the panic
 	// to STDERR otherwise the program may exit before we finish printing.
 	defer cancelFn(e)
+
+	firstPanic.CompareAndSwap(nil, e)
+
+	// WARN WARN WARN WARN WARN
+	process(e) // process immediately
+
 	if testNoLog.Load() {
 		return
 	}
@@ -202,6 +370,9 @@ func handlePanic(e *Error, timeout time.Duration) {
 //
 // Capture calls function fn directly, not in a goroutine, and safely recovers
 // from any panic that occurs during its execution.
+//
+// If fn panics all channels will be notified and Contexts canceled before
+// Capture ends.
 func Capture(fn func()) {
 	defer func() {
 		if e := recover(); e != nil {

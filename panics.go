@@ -18,7 +18,8 @@ const writeTimeout = 100 * time.Millisecond
 
 var (
 	panicked   atomic.Bool
-	testNoLog  atomic.Bool
+	testNoLog  atomic.Bool  // TODO: make this configurable
+	delivering atomic.Int32 // TODO: rename
 	firstPanic atomic.Pointer[Error]
 	stderr     io.Writer = os.Stderr
 )
@@ -54,7 +55,6 @@ func (e *Error) Stack() []byte {
 	return e.stack
 }
 
-// Value returns the value that the program panicked with.
 // Value returns the value that panic was called with.
 func (e *Error) Value() any {
 	return e.value
@@ -107,16 +107,63 @@ func (e *Error) WriteTo(w io.Writer) (int64, error) {
 	return int64(n), err
 }
 
-var handlers struct {
-	sync.Mutex
-	m map[chan<- *Error]struct{}
+// First returns the Error of the first panic or nil if no panics were captured.
+func First() *Error {
+	if e := firstPanic.Load(); e != nil {
+		return e
+	}
+	if !panicked.Load() {
+		return nil
+	}
+	// We're actively handling a panic. Wait until the stack trace has been
+	// collected and the Error is stored in firstPanic.
+	for {
+		if e := firstPanic.Load(); e != nil {
+			return e
+		}
+		runtime.Gosched()
+	}
 }
 
-func notifyLocked(ch chan<- *Error) {
-	if handlers.m == nil {
-		handlers.m = make(map[chan<- *Error]struct{})
+var handlers struct {
+	sync.Mutex
+	m    map[chan<- *Error]struct{}
+	mctx map[*panicsCtx]struct{}
+
+	// TODO: document why we have these
+	stopping    []chan<- *Error
+	stoppingCtx []*panicsCtx
+}
+
+// TODO: organize this code
+
+func stopCtx(c *panicsCtx) {
+	handlers.Lock()
+	if _, ok := handlers.mctx[c]; !ok {
+		handlers.Unlock()
+		return
 	}
-	handlers.m[ch] = struct{}{}
+	delete(handlers.mctx, c)
+	if c.Err() != nil {
+		handlers.Unlock()
+		return
+	}
+	// Handle pending panics
+	handlers.stoppingCtx = append(handlers.stoppingCtx, c)
+	handlers.Unlock()
+
+	panicsWaitUntilIdle()
+
+	handlers.Lock()
+	for i, cc := range handlers.stoppingCtx {
+		if cc == c {
+			p := &handlers.stoppingCtx[len(handlers.stoppingCtx)-1]
+			handlers.stoppingCtx = append(handlers.stoppingCtx[:i], handlers.stoppingCtx[i+1:]...)
+			*p = nil // clear reference
+			break
+		}
+	}
+	handlers.Unlock()
 }
 
 // TODO: if a panic already occurred should we immediately send it on the channel??
@@ -125,19 +172,47 @@ func Notify(ch chan<- *Error) {
 		panic("panics: Notify using nil channel")
 	}
 	handlers.Lock()
-	notifyLocked(ch)
+	if handlers.m == nil {
+		handlers.m = make(map[chan<- *Error]struct{})
+	}
+	handlers.m[ch] = struct{}{}
 	handlers.Unlock()
+}
+
+// Wait until there are no more panics waiting to be processed.
+func panicsWaitUntilIdle() {
+	for delivering.Load() != 0 {
+		runtime.Gosched()
+	}
 }
 
 func Stop(ch chan<- *Error) {
 	handlers.Lock()
+	if _, ok := handlers.m[ch]; !ok {
+		handlers.Unlock()
+		return
+	}
 	delete(handlers.m, ch)
+	handlers.stopping = append(handlers.stopping, ch)
+	handlers.Unlock()
+
+	panicsWaitUntilIdle()
+
+	handlers.Lock()
+	for i, c := range handlers.stopping {
+		if c == ch {
+			handlers.stopping = append(handlers.stopping[:i], handlers.stopping[i+1:]...)
+			break
+		}
+	}
 	handlers.Unlock()
 }
 
+// WARN: do we want to handle sending on a closed channel ???
 func process(e *Error) {
 	handlers.Lock()
 	defer handlers.Unlock()
+	// notify channels
 	for c := range handlers.m {
 		// send Error but do not block for it
 		select {
@@ -145,61 +220,45 @@ func process(e *Error) {
 		default:
 		}
 	}
-	// Wait for all notified Contexts to be cancelled before returning.
-	// Otherwise, Capture can return before any Contexts are cancelled.
-	//
-	// The handlers lock must be held to prevent the WaitGroup from being
-	// incremented by new Contexts that were not signaled.
-	contextWaitGroup.Wait()
+	for _, c := range handlers.stopping {
+		select {
+		case c <- e:
+		default:
+		}
+	}
+	// cancel Contexts with error
+	for c := range handlers.mctx {
+		c.cancel(e)
+	}
+	// optimized map clear
+	for c := range handlers.mctx {
+		delete(handlers.mctx, c)
+	}
+	for _, c := range handlers.stoppingCtx {
+		c.cancel(e)
+	}
 }
 
-// Actually the lock around Notify should prevent this
-//
-// WARN: using this could lead to issues if we call Notify during process()
-var contextWaitGroup sync.WaitGroup
-
 // TODO: note that we set the cancel cause
+//
+// NOTE: that in the event of multiple concurrent panics the panic
+// the Context is cancelled with is non-deterministic.
 func NotifyContext(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancelCause(parent)
 	c := &panicsCtx{
 		Context: ctx,
 		cancel:  cancel,
-		ch:      make(chan *Error, 1),
 	}
-	// WARN WARN WARN WARN WARN WARN WARN
-	//
-	// I'm not sure we need this - model it out
-	//
-	// 	1. Notify
-	// 	2. panic -> process
-	// 	3. Add()
-	// 	3. goroutine starts
-	// 	3. process (ok)
-	// 	4.
-	//
-	// WARN WARN WARN WARN WARN WARN WARN
-	//
-	// Hold the lock so that the WaitGroup cannot be incremented by while
-	// we're processing a panic.
 	handlers.Lock()
-	defer handlers.Unlock()
-	notifyLocked(c.ch)
+	if handlers.mctx == nil {
+		handlers.mctx = make(map[*panicsCtx]struct{})
+	}
+	handlers.mctx[c] = struct{}{}
+	handlers.Unlock()
 	if ctx.Err() == nil {
-		contextWaitGroup.Add(1)
 		go func() {
-			defer func() {
-				contextWaitGroup.Done()
-				// If we're handling a panic this will be called after
-				// process() exits and releases the handlers lock.
-				// As a result this goroutine may still be briefly alive
-				// after Capture or Go exit.
-				Stop(c.ch)
-			}()
-			select {
-			case e := <-c.ch:
-				c.cancel(e)
-			case <-c.Done():
-			}
+			<-c.Done()
+			stopCtx(c)
 		}()
 	}
 	return c, c.stop
@@ -208,20 +267,17 @@ func NotifyContext(parent context.Context) (context.Context, context.CancelFunc)
 type panicsCtx struct {
 	context.Context
 	cancel context.CancelCauseFunc
-	ch     chan *Error
 }
 
 func (c *panicsCtx) stop() {
-	// handle a race between the user calling stop and a panic being sent
-	select {
-	case e := <-c.ch:
-		c.cancel(e)
-	default:
-		c.cancel(nil)
-	}
-	Stop(c.ch)
+	// WARN: this causes us to take the slow handlers.stopped path !!!
+	stopCtx(c)
+	c.cancel(nil)
 }
 
+// WARN: a nil return value here is a valid error !!!
+// ^^^^^^ This should not be a *huge* concern ^^^^^^
+//
 // TODO: rename
 func ContextPanicError(ctx context.Context) *Error {
 	if ctx == nil {
@@ -340,8 +396,6 @@ func handlePanic(e *Error, timeout time.Duration) {
 	// to STDERR otherwise the program may exit before we finish printing.
 	defer cancelFn(e)
 
-	firstPanic.CompareAndSwap(nil, e)
-
 	// WARN WARN WARN WARN WARN
 	process(e) // process immediately
 
@@ -377,6 +431,9 @@ func Capture(fn func()) {
 	defer func() {
 		if e := recover(); e != nil {
 			first := panicked.CompareAndSwap(false, true) // first panic
+			delivering.Add(1)
+			defer delivering.Add(-1)
+
 			// Only include all goroutines for the first panic.
 			all := first && includeAllGoroutines()
 			buf := make([]byte, 2048)
@@ -389,7 +446,12 @@ func Capture(fn func()) {
 				}
 				buf = append(buf, make([]byte, len(buf))...)
 			}
-			handlePanic(&Error{value: e, stack: buf, recovered: !first}, writeTimeout)
+
+			err := &Error{value: e, stack: buf, recovered: !first}
+			if first {
+				firstPanic.CompareAndSwap(nil, err)
+			}
+			handlePanic(err, writeTimeout)
 		}
 	}()
 	fn()

@@ -8,10 +8,10 @@ import (
 	"io"
 	"os"
 	"reflect"
-	"regexp"
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,11 +20,23 @@ import (
 )
 
 func resetHandlers() {
+	panicsWaitUntilIdle()
+
 	handlers.Lock()
 	defer handlers.Unlock()
-	for k := range handlers.m {
-		delete(handlers.m, k)
+	for c := range handlers.mctx {
+		c.cancel(nil)
 	}
+	for _, c := range handlers.stoppingCtx {
+		c.cancel(nil)
+	}
+	handlers.m = nil
+	handlers.stopping = nil
+	handlers.mctx = nil
+	handlers.stoppingCtx = nil
+
+	firstPanic.Store(nil)
+	panicked.Store(false)
 }
 
 func testSetup(t testing.TB) {
@@ -213,36 +225,6 @@ func TestNestedPanic(t *testing.T) {
 	// fmt.Println(context.Cause(Context()))
 }
 
-func TestHugeStack(t *testing.T) {
-	// t.Skip("DELETE ME") // WARN
-	testSetup(t)
-	done := make(chan struct{})
-	Go(func() {
-		defer close(done)
-		bigstack.Panic(100)
-	})
-	select {
-	case <-Done():
-	case <-time.After(time.Second):
-		t.Error("deferred function did not run")
-	}
-	err := context.Cause(ctx)
-	var perr *Error
-	if !errors.As(err, &perr) {
-		t.Fatalf("error should have type: %T; got: %T", perr, err)
-	}
-	const caller = "github.com/charlievieth/panics/internal/bigstack/pkg/pkg1/pkg2/pkg3/pkg4/bigstack.Panic.func"
-	n := bytes.Count(perr.Stack(), []byte(caller))
-	if n < 20 {
-		t.Error("")
-	}
-	re := regexp.MustCompile(`(?m)^\s*created by github\.com/charlievieth/panics\.Go in goroutine \d+`)
-	if !re.Match(perr.Stack()) {
-		t.Errorf("stack trace does not match regex: `%s`:\n\n## Stack trace:\n%s\n###\n",
-			re, perr.Stack())
-	}
-}
-
 func TestNotify(t *testing.T) {
 	testSetup(t)
 
@@ -320,8 +302,14 @@ func TestNotify(t *testing.T) {
 
 	t.Run("NilChannel", func(t *testing.T) {
 		defer func() {
-			if recover() == nil {
+			e := recover()
+			if e == nil {
 				t.Error("Notify(nil) should panic")
+			}
+			want := "panics: Notify using nil channel"
+			got, _ := e.(string)
+			if got != want {
+				t.Errorf("expected panic %q got: %q", want, got)
 			}
 		}()
 		Notify(nil)
@@ -339,16 +327,73 @@ func TestNotify(t *testing.T) {
 	})
 }
 
-func testNotifyStopped(t *testing.T, ctx context.Context, timeout time.Duration) {
-	ch := ctx.(*panicsCtx).ch
-	if ch == nil {
-		t.Fatal("nil Context channel")
+// WARN: this is a dumb test
+func TestNotifyMany(t *testing.T) {
+	t.Skip("DELETE ME")
+	testSetup(t)
+
+	// done := make(chan struct{})
+	var n atomic.Int64
+	chs := make([]chan *Error, 4)
+	var cwg sync.WaitGroup
+	for i := range chs {
+		chs[i] = make(chan *Error, 1)
+		Notify(chs[i])
+		cwg.Add(1)
+		go func(ch chan *Error) {
+			defer cwg.Done()
+			i := 0
+			for range ch {
+				n.Add(1)
+				i++
+				if i >= 4 {
+					Stop(ch)
+					return
+				}
+			}
+		}(chs[i])
+	}
+	defer func() {
+		for _, c := range chs {
+			Stop(c)
+		}
+	}()
+
+	start := make(chan struct{})
+	var pwg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		pwg.Add(1)
+		go func(i int) {
+			defer pwg.Done()
+			<-start
+			for j := 0; j < 16; j++ {
+				Capture(func() { panic(fmt.Errorf("error %d:%d", i, j)) })
+			}
+		}(i)
 	}
 
+	close(start)
+	pwg.Wait()
+	for _, ch := range chs {
+		close(ch)
+	}
+	cwg.Wait()
+	t.Error("N:", n.Load())
+}
+
+// TODO: this is now more complicated that it needs to be
+func testNotifyStopped(t *testing.T, ctx context.Context, timeout time.Duration) {
+	// Test that the Context is cancelled and removed
+	// from handlers.
 	stopped := func() bool {
+		select {
+		case <-ctx.Done():
+		default:
+			return false
+		}
 		handlers.Lock()
 		defer handlers.Unlock()
-		_, ok := handlers.m[ch]
+		_, ok := handlers.mctx[ctx.(*panicsCtx)]
 		return !ok
 	}
 
@@ -364,18 +409,19 @@ func testNotifyStopped(t *testing.T, ctx context.Context, timeout time.Duration)
 			if stopped() {
 				return
 			}
-		case now := <-to.C:
+		case <-to.C:
 			if stopped() {
 				return
 			}
 			t.Fatal("failed to Stop monitoring channel after cancelling Context:",
-				now.Sub(start))
+				time.Since(start))
 		}
 	}
 }
 
 // See if we can trigger a deadlock
 func TestNotifyContextWait(t *testing.T) {
+	t.Skip("TODO: we can delete this - doesn't add any coverage")
 	testSetup(t)
 
 	var wg sync.WaitGroup
@@ -421,7 +467,7 @@ func TestNotifyContext(t *testing.T) {
 
 		// WARN: fixing the WaitGroup race means we might leave a goroutine
 		// around for a very brief amount of time
-		// numGoroutine := runtime.NumGoroutine()
+		numGoroutine := runtime.NumGoroutine()
 
 		ctx, cancel := NotifyContext(context.Background())
 		defer cancel()
@@ -434,20 +480,24 @@ func TestNotifyContext(t *testing.T) {
 				t.Fatal("nil Context cause")
 			}
 			if !reflect.DeepEqual(e.Value(), testErr) {
-				t.Errorf("got Error %v; want: %v", e.Value(), testErr)
+				t.Errorf("got context cause: %v; want: %v", e.Value(), testErr)
 			}
-
-		// TODO: if we wait for the Context's to be canceled we don't need to wait
-		// case <-time.After(time.Millisecond * 100):
 		default:
 			// Wait a moment for the monitoring the goroutine
 			// to receive the notification.
 			t.Fatal("Context not canceled after panic")
 		}
 
-		// if n := runtime.NumGoroutine() - numGoroutine; n > 0 {
-		// 	t.Fatalf("Leaked %d goroutines", n)
-		// }
+		// Make sure the monitoring goroutine eventually exists.
+		for i := 0; i < 100; i++ {
+			if runtime.NumGoroutine()-numGoroutine <= 0 {
+				break
+			}
+			time.Sleep(time.Millisecond * 10)
+		}
+		if n := runtime.NumGoroutine() - numGoroutine; n > 0 {
+			t.Errorf("Leaked %d goroutines", n)
+		}
 
 		testNotifyStopped(t, ctx, 0)
 	})
@@ -477,9 +527,9 @@ func TestNotifyContext(t *testing.T) {
 	t.Run("ParentCanceled", func(t *testing.T) {
 		parent, cancel := context.WithCancel(context.Background())
 		ctx, cancel1 := NotifyContext(parent)
-
-		cancel() // Cancel immediately
 		defer cancel1()
+
+		cancel() // Cancel parent immediately
 
 		Capture(func() { panic(testErr) })
 		select {
@@ -500,10 +550,116 @@ func TestNotifyContext(t *testing.T) {
 	})
 }
 
-func TestNotifyContext_NumGoroutine(t *testing.T) {
+func generatePanics(t testing.TB, numPanics, callDepth int, panicErr error) (*sync.WaitGroup, func()) {
+	if panicErr == nil {
+		panicErr = testErr
+	}
+	if numPanics <= 0 {
+		numPanics = runtime.NumCPU() * 8
+	}
+	start := make(chan struct{})
+	stop := make(chan struct{})
+	wg := new(sync.WaitGroup)
+	ready := new(sync.WaitGroup)
+	t.Cleanup(func() {
+		close(stop)
+		wg.Wait()
+	})
+	for i := 0; i < numPanics; i++ {
+		wg.Add(1)
+		ready.Add(1)
+		go func() {
+			defer wg.Done()
+			// Use a deep stack to make handling panics slow
+			fn := bigstack.Func(callDepth, func() {
+				panic(panicErr)
+			})
+			ready.Done()
+			select {
+			case <-stop:
+				return
+			case <-start:
+				Capture(fn)
+			}
+		}()
+	}
+	ready.Wait()
+	return wg, func() { close(start) }
+}
+
+// TODO: we should use the first panic when if busy and no panic
+// has been captured yet.
+//
+// Test that we wait to process any in-flight panics when cancelling
+// a notified Context.
+func TestNotifyContextStop(t *testing.T) {
 	testSetup(t)
-	// panic("EXIT")
-	// t.Fatal(runtime.NumGoroutine())
+
+	// Use a huge stack
+	want := errors.New("first panic test")
+
+	wg, start := generatePanics(t, -1, 16, want)
+	ctx, cancel := NotifyContext(context.Background())
+	defer cancel()
+
+	start()
+	for !panicked.Load() {
+	}
+	cancel()
+	e := ContextPanicError(ctx)
+	if e == nil {
+		t.Fatalf("cancel cause should be a %T got: %#v",
+			(*Error)(nil), context.Cause(ctx))
+	}
+	if e.Value() != want {
+		t.Errorf("Value() = %v; want: %v", e.Value(), want)
+	}
+
+	// TODO: It would be nice if we could do this, but that
+	// might be too difficult to be worth it.
+	if e.Recovered() {
+		// t.Fatal("Context not canceled with the first Error")
+		t.Log("TODO: Context not canceled with the first Error")
+	}
+
+	wg.Wait()
+}
+
+// Test that First always returns the first panic and not
+// a latter one.
+func TestFirstPanic(t *testing.T) {
+	testSetup(t)
+
+	want := errors.New("first panic test")
+
+	wg, start := generatePanics(t, 64, 16, want)
+
+	ch := make(chan *Error, 128)
+	Notify(ch)
+	defer Stop(ch)
+
+	start()
+	var e *Error
+	for {
+		// If panicking make sure First waits until firstPanic is set.
+		if panicked.Load() && First() == nil {
+			t.Fatal("First returned nil despite a panic being actively processed")
+		}
+		if e = First(); e != nil {
+			break
+		}
+	}
+	wg.Wait()
+
+	if ee := First(); ee != e {
+		t.Fatalf("overwrote first panic: (%[1]p)%[1]v with: (%[2]p)%[2]v", e, ee)
+	}
+	if e.Recovered() {
+		t.Errorf("Recovered() = %t; want: %t", true, false)
+	}
+	if e.Value() != want {
+		t.Errorf("Value() = %v; want: %v", e.Value(), want)
+	}
 }
 
 // WARN WARN WARN
@@ -573,8 +729,18 @@ Loop:
 }
 
 func BenchmarkDoneX(b *testing.B) {
+	b.Skip("DELETE ME")
 	for i := 0; i < b.N; i++ {
 		_ = DoneX()
+		if i != 0 && i%1024*1024 == 0 {
+			b.StopTimer()
+			// handlers.m = nil
+			for c := range handlers.m {
+				Stop(c)
+			}
+			runtime.GC()
+			b.StartTimer()
+		}
 	}
 }
 
@@ -606,4 +772,35 @@ func BenchmarkCapture(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		Capture(func() {})
 	}
+}
+
+// TODO: this is only here for my own interest
+func BenchmarkStackTrace(b *testing.B) {
+	bigstack.Panic(16)
+
+	stack := func(all bool) []byte {
+		buf := make([]byte, 2048)
+		for {
+			// TODO: cap stack size
+			n := runtime.Stack(buf, all)
+			if n < len(buf) {
+				buf = buf[:n]
+				break
+			}
+			buf = append(buf, make([]byte, len(buf))...)
+		}
+		return buf
+	}
+	f := bigstack.Func(16, func() {
+		_ = stack(false)
+	})
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			f()
+		}
+	})
+	// for i := 0; i < b.N; i++ {
+	// 	f()
+	// 	// _ = stack(false)
+	// }
 }

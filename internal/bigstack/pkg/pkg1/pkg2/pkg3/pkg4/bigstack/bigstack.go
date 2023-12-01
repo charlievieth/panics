@@ -6,18 +6,24 @@ import "errors"
 
 var Error = errors.New("bigstack: test panic")
 
-func Panic(n int) {
+// Func returns func fn wrapped by n outer functions.
+func Func(n int, fn func()) func() {
 	if n < 1 {
 		panic("non-positive size")
 	}
 	f := func() {
-		panic(Error)
+		fn()
 	}
 	for i := 0; i < n; i++ {
-		fn := f
+		ff := f
 		f = func() {
-			fn()
+			ff()
 		}
 	}
-	f()
+	return f
+}
+
+// Panic panics with a callstack at least n calls deep.
+func Panic(n int) {
+	Func(n, func() { panic(Error) })()
 }

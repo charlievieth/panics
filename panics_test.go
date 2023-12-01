@@ -88,6 +88,38 @@ func TestGoPanic(t *testing.T) {
 	testCapturePanic(t, Go)
 }
 
+// WARN: rename
+func WaitFor(ch <-chan *Error) <-chan *Error {
+	// Can't wait for un-buffered channels.
+	if len(ch) == 0 && cap(ch) > 0 {
+		panicsWaitUntilIdle()
+	}
+	return ch
+}
+
+func TestGoPanicWaitGroup(t *testing.T) {
+	testSetup(t)
+	ch := make(chan *Error)
+	Notify(ch)
+	hits := 0
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		Go(func() {
+			defer wg.Done()
+			panic(1)
+		})
+		wg.Wait()
+		select {
+		case <-WaitFor(ch):
+			hits++
+		default:
+			// case <-time.After(time.Millisecond * 10):
+		}
+	}
+	t.Error("Hits:", hits)
+}
+
 func TestCapturePanicNilFunc(t *testing.T) {
 	testSetup(t)
 	ctx := Context()
@@ -117,7 +149,7 @@ func TestCaptureAllocs(t *testing.T) {
 		Capture(func() {})
 	})
 	if allocs != 0 {
-		t.Errorf("Capture should not allocate: got %.2f allocs per run", allocs)
+		t.Errorf("Unexpected number of allocations, got %f, want 0", allocs)
 	}
 }
 
@@ -768,10 +800,27 @@ func BenchmarkHandlePanic(b *testing.B) {
 	}
 }
 
-func BenchmarkCapture(b *testing.B) {
+func BenchmarkFirst(b *testing.B) {
+	panicked.Store(false)
+	defer panicked.Store(false)
 	for i := 0; i < b.N; i++ {
-		Capture(func() {})
+		first := !panicked.Load() && panicked.CompareAndSwap(false, true)
+		_ = first
 	}
+}
+
+func BenchmarkCapture(b *testing.B) {
+	testSetup(b)
+	b.Run("NoPanic", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			Capture(func() {})
+		}
+	})
+	b.Run("Panic", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			Capture(func() { panic(1) })
+		}
+	})
 }
 
 // TODO: this is only here for my own interest

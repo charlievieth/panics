@@ -24,6 +24,30 @@ var (
 	stderr     io.Writer = os.Stderr
 )
 
+var (
+	output        atomic.Pointer[writer]
+	nopPanicWrite *writer = nil
+)
+
+type writer struct {
+	w io.Writer
+}
+
+func (w *writer) Write(p []byte) (int, error) {
+	if w == nil || w.w == nil {
+		return len(p), nil
+	}
+	return w.w.Write(p)
+}
+
+func SetOutput(w io.Writer) {
+	if w == nil || w == io.Discard {
+		output.Store(nil)
+	} else {
+		output.Store(&writer{w})
+	}
+}
+
 // TODO: remove if not used
 //
 // panicsCtxKey is the key that identifies a context that is a child
@@ -44,13 +68,13 @@ type Error struct {
 	recovered bool
 }
 
-// Error returns an error that contains the value passed to panic and a
-// stack trace captured at the site of the panic.
+// Error returns the value panic() was called with followed by a newline and
+// the stack trace captured at the site of the panic.
 func (e *Error) Error() string {
 	return fmt.Sprintf("%v\n\n%s", e.value, e.stack)
 }
 
-// Stack returns the stack trace that was capturing during program panic.
+// Stack returns the stack trace that was captured during program panic.
 func (e *Error) Stack() []byte {
 	return e.stack
 }

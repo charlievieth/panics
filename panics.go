@@ -339,33 +339,8 @@ func CapturedPanic() *Error {
 	return err
 }
 
-// WARN: do we want this ???
-//
-// TODO: describe that this is a wrapper around context.AfterFunc
-//
-// AfterFunc arranges to call f in its own goroutine after ctx is done
-// (cancelled or timed out).
-// If ctx is already done, AfterFunc calls f immediately in its own goroutine.
-//
-// Multiple calls to AfterFunc on a context operate independently;
-// one does not replace another.
-//
-// Calling the returned stop function stops the association of ctx with f.
-// It returns true if the call stopped f from being run.
-// If stop returns false,
-// either the context is done and f has been started in its own goroutine;
-// or f was already stopped.
-// The stop function does not wait for f to complete before returning.
-// If the caller needs to know whether f is completed,
-// it must coordinate with f explicitly.
-//
-// If ctx has a "AfterFunc(func()) func() bool" method,
-// AfterFunc will use it to schedule the call.
-func AfterFunc(fn func(e *Error)) (stop func() bool) {
-	return context.AfterFunc(ctx, func() {
-		fn(CapturedPanic())
-	})
-}
+// TODO: Consider adding an AfterFunc with signature:
+// 	AfterFunc(fn func(e *Error)) (stop func() bool) {}
 
 func includeAllGoroutines() bool {
 	s := os.Getenv("GOTRACEBACK")

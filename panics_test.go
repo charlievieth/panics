@@ -8,8 +8,8 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"regexp"
 	"runtime"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,11 +19,33 @@ import (
 	"github.com/charlievieth/panics/internal/bigstack/pkg/pkg1/pkg2/pkg3/pkg4/bigstack"
 )
 
-func resetHandlers() {
+func resetHandlers(t testing.TB) {
 	panicsWaitUntilIdle()
 
 	handlers.Lock()
 	defer handlers.Unlock()
+
+	// Test that we don't leak references when deleting elements from
+	// the stopping* slices.
+	if cap(handlers.stopping) > 0 {
+		a := handlers.stopping
+		a = a[len(a):cap(a)]
+		for i, c := range a {
+			if c != nil {
+				t.Errorf("Leaked %T: handlers.stopping[%d] = %v; want: %v", c, i, c, nil)
+			}
+		}
+	}
+	if cap(handlers.stoppingCtx) > 0 {
+		a := handlers.stoppingCtx
+		a = a[len(a):cap(a)]
+		for i, c := range a {
+			if c != nil {
+				t.Errorf("Leaked %T: handlers.stoppingCtx[%d] = %v; want: %v", c, i, c, nil)
+			}
+		}
+	}
+
 	for c := range handlers.mctx {
 		c.cancel(nil)
 	}
@@ -40,42 +62,47 @@ func resetHandlers() {
 }
 
 func testSetup(t testing.TB) {
-	testNoLog.Store(true)
-	resetHandlers()
-	ctx, cancelFn = context.WithCancelCause(context.Background())
+	SetOutput(nil)
+	resetHandlers(t)
 	t.Cleanup(func() {
-		testNoLog.Store(false)
-		resetHandlers()
-		ctx, cancelFn = context.WithCancelCause(context.Background())
+		SetOutput(os.Stderr)
+		resetHandlers(t)
 	})
 }
 
 var testErr = errors.New("test error")
 
+func testNotify(t testing.TB) <-chan *Error {
+	ch := make(chan *Error, 1)
+	Notify(ch)
+	t.Cleanup(func() {
+		Stop(ch)
+	})
+	return ch
+}
+
 func testCapturePanic(t *testing.T, fn func(call func())) {
 	testSetup(t)
+	ch := testNotify(t)
 	fn(func() { panic(testErr) })
 	select {
-	case <-Done():
+	case <-ch:
 		// Ok
 	case <-time.After(time.Second):
+		// WARN: remove time.After
 		t.Fatal("panic did not cancel Context")
 	}
-	err := context.Cause(Context())
-	perr, ok := err.(*Error)
-	if !ok {
-		t.Fatalf("error should have type: %T; got: %T", perr, err)
-	}
-	if perr == nil {
+	err := First()
+	if err == nil {
 		t.Fatal("nil error")
 	}
-	if !reflect.DeepEqual(perr.Value(), testErr) {
+	if !reflect.DeepEqual(err.Value(), testErr) {
 		t.Errorf("Value() = %v; want: %v", err, testErr)
 	}
-	if !reflect.DeepEqual(perr.Unwrap(), testErr) {
+	if !reflect.DeepEqual(err.Unwrap(), testErr) {
 		t.Errorf("Unwrap() = %v; want: %v", err, testErr)
 	}
-	if len(perr.Stack()) == 0 {
+	if len(err.Stack()) == 0 {
 		t.Error("empty stack trace")
 	}
 }
@@ -88,6 +115,58 @@ func TestGoPanic(t *testing.T) {
 	testCapturePanic(t, Go)
 }
 
+func TestCaptureValue(t *testing.T) {
+	testSetup(t)
+	i := CaptureValue(func() int {
+		return 1
+	})
+	if i != 1 {
+		t.Errorf("CaptureValue() = %d; want: %d", i, 1)
+	}
+	ctx, cancel := NotifyContext(context.Background())
+	defer cancel()
+	j := CaptureValue(func() int {
+		panic("here")
+		// unreachable
+	})
+	if j != 0 {
+		t.Errorf("CaptureValue() = %d; want: %d", j, 0)
+	}
+	select {
+	case <-ctx.Done():
+		// Ok
+	default:
+		// WARN: remove time.After
+		t.Fatal("panic did not cancel Context")
+	}
+}
+
+func TestCaptureValues(t *testing.T) {
+	testSetup(t)
+	i, err := CaptureValues(func() (int, error) {
+		return 1, testErr
+	})
+	if i != 1 || err != testErr {
+		t.Errorf("CaptureValues() = %d, %v; want: %d, %v", i, err, 1, testErr)
+	}
+	ctx, cancel := NotifyContext(context.Background())
+	defer cancel()
+	j, err := CaptureValues(func() (int, error) {
+		panic("here")
+		// unreachable
+	})
+	if j != 0 || err != nil {
+		t.Errorf("CaptureValues() = %d, %v; want: %d, %v", j, err, 0, nil)
+	}
+	select {
+	case <-ctx.Done():
+		// Ok
+	default:
+		// WARN: remove time.After
+		t.Fatal("panic did not cancel Context")
+	}
+}
+
 // WARN: rename
 func WaitFor(ch <-chan *Error) <-chan *Error {
 	// Can't wait for un-buffered channels.
@@ -97,9 +176,9 @@ func WaitFor(ch <-chan *Error) <-chan *Error {
 	return ch
 }
 
-func TestGoPanicWaitGroup(t *testing.T) {
+func TestWaitFor(t *testing.T) {
 	testSetup(t)
-	ch := make(chan *Error)
+	ch := make(chan *Error, 1)
 	Notify(ch)
 	hits := 0
 	var wg sync.WaitGroup
@@ -114,31 +193,29 @@ func TestGoPanicWaitGroup(t *testing.T) {
 		case <-WaitFor(ch):
 			hits++
 		default:
-			// case <-time.After(time.Millisecond * 10):
+			t.Error("missed panic:", i)
 		}
 	}
-	t.Error("Hits:", hits)
+	if hits != 10 {
+		t.Errorf("missed %d/%d panics", 10-hits, 10)
+	}
 }
 
 func TestCapturePanicNilFunc(t *testing.T) {
 	testSetup(t)
-	ctx := Context()
+	ch := testNotify(t)
 	Capture(nil)
 	select {
-	case <-ctx.Done():
+	case <-ch:
 		// Ok
 	default:
 		t.Error("panic did not cancel Context")
 	}
-	err := context.Cause(ctx)
-	perr, ok := err.(*Error)
-	if !ok {
-		t.Fatalf("error should have type: %T; got: %T", perr, err)
-	}
-	if perr == nil {
+	err := First()
+	if err == nil {
 		t.Fatal("nil error")
 	}
-	if _, ok := perr.Value().(runtime.Error); !ok {
+	if _, ok := err.Value().(runtime.Error); !ok {
 		t.Errorf("expected runtime.Error got: %T", err)
 	}
 }
@@ -153,36 +230,10 @@ func TestCaptureAllocs(t *testing.T) {
 	}
 }
 
-func TestGoRuntimeGoexit(t *testing.T) {
-	testSetup(t)
-	done := make(chan struct{})
-	Go(func() {
-		defer close(done)
-		runtime.Goexit()
-	})
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Error("deferred function did not run")
-	}
-	select {
-	case <-Done():
-		t.Error("runtime.Goexit should not be considered a panic")
-	default:
-	}
-}
-
-type writerFunc func(p []byte) (int, error)
-
-func (f writerFunc) Write(p []byte) (int, error) {
-	return f(p)
-}
-
 // Test that slow writes to STDERR do not prevent us from handling the panic
 // and cancelling the context.
 func TestHandlePanicSlowStderr(t *testing.T) {
 	t.Cleanup(func() {
-		stderr = os.Stderr
 		testSetup(t) // replace context on exit
 	})
 
@@ -190,18 +241,16 @@ func TestHandlePanicSlowStderr(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), delay)
 	t.Cleanup(cancel)
-	stderr = writerFunc(func(p []byte) (int, error) {
-		<-ctx.Done()
-		return len(p), nil
-	})
+	SetOutput(WriterFunc(func(p []byte) { <-ctx.Done() }))
 
+	ch := testNotify(t)
 	Go(func() {
 		panic(testErr)
 	})
 
 	start := time.Now()
 	select {
-	case <-Done():
+	case <-ch:
 		// Ok
 	case now := <-time.After(delay * 5):
 		t.Fatal("timed out after:", now.Sub(start))
@@ -210,51 +259,24 @@ func TestHandlePanicSlowStderr(t *testing.T) {
 
 func TestHandlePanicPanicWriter(t *testing.T) {
 	t.Cleanup(func() {
-		stderr = os.Stderr
 		testSetup(t) // replace context on exit
 	})
 
 	const delay = 10 * time.Millisecond
-	stderr = writerFunc(func(_ []byte) (int, error) {
-		panic("write")
-	})
+	SetOutput(WriterFunc(func(_ []byte) { panic("write") }))
 
+	ch := testNotify(t)
 	Go(func() {
 		panic(testErr)
 	})
 
 	start := time.Now()
 	select {
-	case <-Done():
+	case <-ch:
 		// Ok
 	case now := <-time.After(delay * 5):
 		t.Fatal("timed out after:", now.Sub(start))
 	}
-}
-
-func TestNestedPanic(t *testing.T) {
-	t.Skip("DELETE ME")
-	testSetup(t)
-	// defer testSetup(t)
-
-	if false {
-		func() {
-			defer func() {
-				panic("P2")
-			}()
-			panic("P1")
-		}()
-		return
-	}
-	Capture(func() {
-		defer Capture(func() {
-			panic("P2")
-		})
-		panic("P1")
-	})
-	panic(CapturedPanic())
-
-	// fmt.Println(context.Cause(Context()))
 }
 
 func TestNotify(t *testing.T) {
@@ -521,11 +543,12 @@ func TestNotifyContext(t *testing.T) {
 		}
 
 		// Make sure the monitoring goroutine eventually exists.
-		for i := 0; i < 100; i++ {
+		start := time.Now()
+		for time.Since(start) < time.Second {
 			if runtime.NumGoroutine()-numGoroutine <= 0 {
 				break
 			}
-			time.Sleep(time.Millisecond * 10)
+			runtime.Gosched()
 		}
 		if n := runtime.NumGoroutine() - numGoroutine; n > 0 {
 			t.Errorf("Leaked %d goroutines", n)
@@ -582,14 +605,14 @@ func TestNotifyContext(t *testing.T) {
 	})
 }
 
-func generatePanics(t testing.TB, numPanics, callDepth int, panicErr error) (*sync.WaitGroup, func()) {
-	if panicErr == nil {
-		panicErr = testErr
+// createGoroutines creates count goroutines that will wait until the returned
+// start function is called to call fn via Capture. The returned WaitGroup
+// should be waited on to ensure all the goroutines exited.
+func createGoroutines(t testing.TB, count int, fn func()) (_ *sync.WaitGroup, start func()) {
+	if count <= 0 {
+		count = runtime.NumCPU() * 8
 	}
-	if numPanics <= 0 {
-		numPanics = runtime.NumCPU() * 8
-	}
-	start := make(chan struct{})
+	startCh := make(chan struct{})
 	stop := make(chan struct{})
 	wg := new(sync.WaitGroup)
 	ready := new(sync.WaitGroup)
@@ -597,33 +620,43 @@ func generatePanics(t testing.TB, numPanics, callDepth int, panicErr error) (*sy
 		close(stop)
 		wg.Wait()
 	})
-	for i := 0; i < numPanics; i++ {
+	for i := 0; i < count; i++ {
 		wg.Add(1)
 		ready.Add(1)
 		go func() {
 			defer wg.Done()
-			// Use a deep stack to make handling panics slow
-			fn := bigstack.Func(callDepth, func() {
-				panic(panicErr)
-			})
 			ready.Done()
 			select {
 			case <-stop:
 				return
-			case <-start:
+			case <-startCh:
 				Capture(fn)
 			}
 		}()
 	}
 	ready.Wait()
-	return wg, func() { close(start) }
+	return wg, func() { close(startCh) }
 }
 
-// TODO: we should use the first panic when if busy and no panic
-// has been captured yet.
-//
+func generatePanics(t testing.TB, numPanics, callDepth int, panicErr any) (*sync.WaitGroup, func()) {
+	if panicErr == nil {
+		panicErr = testErr
+	}
+	if numPanics <= 0 {
+		numPanics = runtime.NumCPU() * 8
+	}
+	return createGoroutines(t, numPanics, bigstack.Func(callDepth, func() {
+		panic(panicErr)
+	}))
+}
+
 // Test that we wait to process any in-flight panics when cancelling
 // a notified Context.
+//
+// TODO: It would be really nice if we could set the cancel cause of
+// all Contexts created before we panicked to the first panic itself,
+// but I'm afraid the coordination required for this would add too
+// much overhead.
 func TestNotifyContextStop(t *testing.T) {
 	testSetup(t)
 
@@ -664,7 +697,7 @@ func TestFirstPanic(t *testing.T) {
 
 	want := errors.New("first panic test")
 
-	wg, start := generatePanics(t, 64, 16, want)
+	wg, start := generatePanics(t, -1, 16, want)
 
 	ch := make(chan *Error, 128)
 	Notify(ch)
@@ -694,106 +727,150 @@ func TestFirstPanic(t *testing.T) {
 	}
 }
 
-// WARN WARN WARN
-func TestDoneX(t *testing.T) {
-
-	t.Skip("FIXME")
-
-	var wg sync.WaitGroup
-	stop := make(chan struct{})
-	for i := 0; i < 1_000; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			tick := time.NewTicker(time.Microsecond)
-			defer tick.Stop()
-			for {
-				select {
-				case <-tick.C:
-					select {
-					case <-DoneX():
-					default:
-					}
-				case <-stop:
-					return
-				}
-			}
-		}()
+// TODO: rename
+func TestFirstPanicHard(t *testing.T) {
+	testSetup(t)
+	numProcs := runtime.GOMAXPROCS(-1)
+	if numProcs > runtime.NumCPU() {
+		numProcs = runtime.NumCPU()
 	}
-	tick := time.NewTicker(time.Millisecond * 100)
-	defer tick.Stop()
-	to := time.NewTimer(time.Second * 5)
-	start := time.Now()
-Loop:
-	for {
-		select {
-		case now := <-tick.C:
-			c := created.Load()
-			f := finalized.Load()
-			fmt.Printf("%s: live: %d created: %d finalized: %d\n",
-				now.Sub(start), c-f, c, f)
-		case <-to.C:
-			break Loop
+	if numProcs > 64 {
+		numProcs = 64
+	}
+	want := errors.New("first panic")
+	hit := 0
+	for i := 0; i < 100; i++ {
+		firstPanic.Store(nil)
+		panicked.Store(false)
+		var first atomic.Bool
+		wg, start := createGoroutines(t, 8, func() {
+			if first.CompareAndSwap(false, true) {
+				panic(want)
+			}
+			panic(testErr)
+		})
+		start()
+		wg.Wait()
+		if First().Value() == want {
+			hit++
 		}
 	}
-	close(stop)
-	wg.Wait()
-
-	fmt.Print("\n# Cleanup:\n\n")
-	{
-		tick := time.NewTicker(time.Millisecond * 500)
-		defer tick.Stop()
-		to := time.NewTimer(time.Second * 5)
-		start := time.Now()
-		for {
-			runtime.GC()
-			select {
-			case now := <-tick.C:
-				c := created.Load()
-				f := finalized.Load()
-				fmt.Printf("%s: live: %d created: %d finalized: %d\n",
-					now.Sub(start), c-f, c, f)
-			case <-to.C:
-				return
-			}
-		}
+	if hit <= 90 {
+		t.Errorf("First() only returned the first panic in %d/100 tests", hit)
 	}
 }
 
-func BenchmarkDoneX(b *testing.B) {
-	b.Skip("DELETE ME")
-	for i := 0; i < b.N; i++ {
-		_ = DoneX()
-		if i != 0 && i%1024*1024 == 0 {
-			b.StopTimer()
-			// handlers.m = nil
-			for c := range handlers.m {
-				Stop(c)
-			}
-			runtime.GC()
-			b.StartTimer()
+type nopWriter struct{}
+
+func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+func TestSetOutput(t *testing.T) {
+	testSetup(t)
+
+	equal := func(w1, w2 *writer) bool {
+		if w1 != nil && w2 != nil {
+			return *w1 == *w2
+		}
+		return w1 == w2
+	}
+
+	tests := []struct {
+		wr   io.Writer
+		want *writer
+	}{
+		{nil, nil},
+		{io.Discard, nil},
+		{os.Stderr, &stderrWriter},
+		{(*bytes.Buffer)(nil), nil},
+		{(*os.File)(nil), nil},
+		{nopWriter{}, &writer{w: nopWriter{}}},
+	}
+	for i, test := range tests {
+		SetOutput(test.wr)
+		if got := output.Load(); !equal(got, test.want) {
+			t.Errorf("%d: SetOutput(%#v) = %+v; want: %+v", i, test.wr, got, test.want)
+		}
+		SetOutput(nil)
+	}
+}
+
+func TestSetOutputNilWriter(t *testing.T) {
+	testSetup(t)
+
+	var wr *bytes.Buffer = nil
+	SetOutput(wr)
+	fmt.Fprintln(output.Load(), "DO NOT PANIC")
+}
+
+// func TestHandlerStoppedLeaks(t *testing.T) {
+// 	testSetup(t)
+// 	numPanics := runtime.NumCPU() * 16
+// 	wg, start := generatePanics(t, numPanics, 32, int32(1))
+
+// 	chs := make([]chan *Error, 16)
+// 	for i := range chs {
+// 		chs[i] = make(chan *Error, 1)
+// 		Notify(chs[i])
+// 	}
+// 	defer func() {
+// 		for _, c := range chs {
+// 			Stop(c)
+// 		}
+// 	}()
+// 	start()
+// 	// for First() == nil {
+// 	// }
+// 	for _, c := range chs {
+// 		Stop(c)
+// 	}
+// 	wg.Wait()
+
+// 	t.Fatal(cap(handlers.stopping))
+// }
+
+func TestPanicsContext(t *testing.T) {
+	test := func(t *testing.T, parent context.Context, want string, replace func(string) string) {
+		t.Helper()
+		ctx, cancel := NotifyContext(parent)
+		defer cancel()
+		got := ctx.(fmt.Stringer).String()
+		orig := got
+		if replace != nil {
+			got = replace(got)
+		}
+		if got != want {
+			t.Logf("Original: %q", orig)
+			t.Errorf("(%T).String() = %q; want: %q", ctx, got, want)
 		}
 	}
+
+	ctx1 := context.Background()
+	test(t, ctx1, "panics.NotifyContext(context.Background)", nil)
+
+	ctx2, cancel2 := context.WithCancel(ctx1)
+	defer cancel2()
+	test(t, ctx2, "panics.NotifyContext(context.Background.WithCancel)", nil)
+
+	ctx3, cancel3 := context.WithTimeout(ctx2, time.Second)
+	defer cancel3()
+	replace := func(s string) string {
+		return regexp.MustCompile(`\(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+[^)]+\)`).
+			ReplaceAllString(s, "")
+	}
+	test(t, ctx3, "panics.NotifyContext(context.Background.WithCancel.WithDeadline)", replace)
 }
 
 func BenchmarkHandlePanic(b *testing.B) {
 	b.Cleanup(func() {
-		stderr = os.Stderr
+		// WARN: we should not be doing this in cleanup !!
 		testSetup(b) // replace context on exit
 	})
-	stack := debug.Stack()
-	for len(stack) < 1024*1024 {
-		stack = append(stack, '\n', '\n')
-		stack = append(stack, stack...)
-	}
-	_ = stack // WARN
 	e := Error{
-		value: testErr,
-		// stack:     stack, // WARN
+		value:     testErr,
 		stack:     bytes.Repeat([]byte("a"), 128),
 		recovered: false,
 	}
-	stderr = io.Discard
+	SetOutput(nil)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		handlePanic(&e, time.Second)
@@ -818,7 +895,8 @@ func BenchmarkCapture(b *testing.B) {
 	})
 	b.Run("Panic", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			Capture(func() { panic(1) })
+			Capture(func() { bigstack.Panic(16) })
+			// Capture(func() { panic(1) })
 		}
 	})
 }

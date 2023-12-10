@@ -115,6 +115,25 @@ func TestGoPanic(t *testing.T) {
 	testCapturePanic(t, Go)
 }
 
+func TestGoWGPanic(t *testing.T) {
+	var wg sync.WaitGroup
+	testCapturePanic(t, func(fn func()) {
+		GoWG(&wg, fn)
+	})
+}
+
+func TestGoWGNilWaitGroup(t *testing.T) {
+	const want = "panics: cannot call GoWG with nil sync.WaitGroup"
+	defer func() {
+		e := recover()
+		s, _ := e.(string)
+		if s != want {
+			t.Fatalf("expected panic: %q; got: %v", want, e)
+		}
+	}()
+	GoWG(nil, func() {})
+}
+
 func TestCaptureValue(t *testing.T) {
 	testSetup(t)
 	i := CaptureValue(func() int {
@@ -381,6 +400,7 @@ func TestNotify(t *testing.T) {
 	})
 }
 
+// WARN: this is dumb but adds SOME coverage
 // WARN: this is a dumb test
 func TestNotifyMany(t *testing.T) {
 	t.Skip("DELETE ME")
@@ -727,7 +747,6 @@ func TestFirstPanic(t *testing.T) {
 	}
 }
 
-// TODO: rename
 func TestFirstPanicHard(t *testing.T) {
 	testSetup(t)
 	numProcs := runtime.GOMAXPROCS(-1)
@@ -743,7 +762,7 @@ func TestFirstPanicHard(t *testing.T) {
 		firstPanic.Store(nil)
 		panicked.Store(false)
 		var first atomic.Bool
-		wg, start := createGoroutines(t, 8, func() {
+		wg, start := createGoroutines(t, numProcs, func() {
 			if first.CompareAndSwap(false, true) {
 				panic(want)
 			}
@@ -757,6 +776,41 @@ func TestFirstPanicHard(t *testing.T) {
 	}
 	if hit <= 90 {
 		t.Errorf("First() only returned the first panic in %d/100 tests", hit)
+	}
+	t.Logf("%d/100", hit)
+}
+
+func TestFirstPanicHarder(t *testing.T) {
+	want := errors.New("first panic")
+	test := func(t *testing.T, num int) {
+		t.Run(fmt.Sprintf("%d", num), func(t *testing.T) {
+			testSetup(t)
+			hit := 0
+			for i := 0; i < 100; i++ {
+				firstPanic.Store(nil)
+				panicked.Store(false)
+				var first atomic.Bool
+				wg, start := createGoroutines(t, num, func() {
+					if first.CompareAndSwap(false, true) {
+						panic(want)
+					}
+					panic(testErr)
+				})
+				start()
+				wg.Wait()
+				if First().Value() == want {
+					hit++
+				}
+			}
+			if hit <= 90 {
+				t.Errorf("First() only returned the first panic in %d/100 tests", hit)
+			} else {
+				t.Logf("%d/100", hit)
+			}
+		})
+	}
+	for _, n := range []int{1, 8, 64, 128, 256, 512, 1024, 8192 /*32 * 1024, 64 * 1024*/} {
+		test(t, n)
 	}
 }
 
@@ -877,15 +931,6 @@ func BenchmarkHandlePanic(b *testing.B) {
 	}
 }
 
-func BenchmarkFirst(b *testing.B) {
-	panicked.Store(false)
-	defer panicked.Store(false)
-	for i := 0; i < b.N; i++ {
-		first := !panicked.Load() && panicked.CompareAndSwap(false, true)
-		_ = first
-	}
-}
-
 func BenchmarkCapture(b *testing.B) {
 	testSetup(b)
 	b.Run("NoPanic", func(b *testing.B) {
@@ -903,8 +948,7 @@ func BenchmarkCapture(b *testing.B) {
 
 // TODO: this is only here for my own interest
 func BenchmarkStackTrace(b *testing.B) {
-	bigstack.Panic(16)
-
+	b.ReportAllocs()
 	stack := func(all bool) []byte {
 		buf := make([]byte, 2048)
 		for {

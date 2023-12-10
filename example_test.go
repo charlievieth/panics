@@ -3,10 +3,55 @@ package panics_test
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
 	"sync"
 
 	"github.com/charlievieth/panics"
 )
+
+func ExampleFirst() {
+	panics.SetPrintStackTrace(false)
+
+	panics.Capture(func() { panic("my panic") })
+	fmt.Println(panics.First().Value())
+
+	// Output:
+	// my panic
+}
+
+func ExampleNotify() {
+	panics.SetPrintStackTrace(false)
+
+	ch := make(chan *panics.Error, 1)
+	panics.Notify(ch)
+
+	panics.Capture(func() { panic("my panic") })
+	e := <-ch
+	fmt.Println(e.Value())
+
+	// Output:
+	// my panic
+}
+
+func ExampleNotifyContext() {
+	panics.SetPrintStackTrace(false)
+
+	ctx, cancel := panics.NotifyContext(context.Background())
+	defer cancel()
+
+	panics.Capture(func() { panic("my panic") })
+	select {
+	case <-ctx.Done():
+		e, _ := context.Cause(ctx).(*panics.Error)
+		fmt.Println(e.Value())
+	default:
+		panic("failed to capture panic!")
+	}
+
+	// Output:
+	// my panic
+}
 
 func ExampleCapture_waitGroup() {
 	panics.SetPrintStackTrace(false)
@@ -38,15 +83,58 @@ func ExampleCapture_waitGroup() {
 	// canceled
 }
 
-func Example_goWG() {
+func ExampleGoWG() {
+	panics.SetPrintStackTrace(false)
+
 	ch := make(chan *panics.Error, 1)
 	panics.Notify(ch)
+
 	var wg sync.WaitGroup
 	panics.GoWG(&wg, func() {
 		panic("here")
 	})
 	wg.Wait()
+
 	// If GoWG is not used then ch may not have been notified of the panic
 	// before wg.Wait returns.
-	fmt.Println(<-ch)
+	select {
+	case <-ch:
+		fmt.Println("ch was notified of the panic")
+	default:
+		fmt.Println("Wait returned before ch was notified")
+	}
+
+	// Output:
+	// ch was notified of the panic
+}
+
+func ExampleSetOutput() {
+	panics.SetPrintStackTrace(true)
+
+	// Use an arbitrary function as the panic output
+	var n int
+	panics.SetOutput(panics.WriterFunc(func(p []byte) {
+		n++
+	}))
+	for i := 0; i < 5; i++ {
+		panics.Capture(func() { panic("my panic") })
+	}
+	fmt.Printf("captured %d panics\n", n)
+
+	// Output:
+	// captured 5 panics
+}
+
+func ExampleWriterFunc() {
+	// This example shows how you can use an arbitrary logger as
+	// the panic output.
+
+	ll := log.New(os.Stdout, "# ", log.LstdFlags)
+
+	panics.SetOutput(panics.WriterFunc(func(p []byte) {
+		ll.Printf("%s\n", p)
+	}))
+	panics.Capture(func() {
+		panic("my panic")
+	})
 }

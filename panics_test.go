@@ -401,61 +401,6 @@ func TestNotify(t *testing.T) {
 	})
 }
 
-// WARN: this is dumb but adds SOME coverage
-// WARN: this is a dumb test
-func TestNotifyMany(t *testing.T) {
-	t.Skip("DELETE ME")
-	testSetup(t)
-
-	// done := make(chan struct{})
-	var n atomic.Int64
-	chs := make([]chan *Error, 4)
-	var cwg sync.WaitGroup
-	for i := range chs {
-		chs[i] = make(chan *Error, 1)
-		Notify(chs[i])
-		cwg.Add(1)
-		go func(ch chan *Error) {
-			defer cwg.Done()
-			i := 0
-			for range ch {
-				n.Add(1)
-				i++
-				if i >= 4 {
-					Stop(ch)
-					return
-				}
-			}
-		}(chs[i])
-	}
-	defer func() {
-		for _, c := range chs {
-			Stop(c)
-		}
-	}()
-
-	start := make(chan struct{})
-	var pwg sync.WaitGroup
-	for i := 0; i < 32; i++ {
-		pwg.Add(1)
-		go func(i int) {
-			defer pwg.Done()
-			<-start
-			for j := 0; j < 16; j++ {
-				Capture(func() { panic(fmt.Errorf("error %d:%d", i, j)) })
-			}
-		}(i)
-	}
-
-	close(start)
-	pwg.Wait()
-	for _, ch := range chs {
-		close(ch)
-	}
-	cwg.Wait()
-	t.Error("N:", n.Load())
-}
-
 // TODO: this is now more complicated that it needs to be
 func testNotifyStopped(t *testing.T, ctx context.Context, timeout time.Duration) {
 	// Test that the Context is cancelled and removed
@@ -494,47 +439,6 @@ func testNotifyStopped(t *testing.T, ctx context.Context, timeout time.Duration)
 	}
 }
 
-// See if we can trigger a deadlock
-func TestNotifyContextWait(t *testing.T) {
-	t.Skip("TODO: we can delete this - doesn't add any coverage")
-	testSetup(t)
-
-	var wg sync.WaitGroup
-	stop := make(chan struct{})
-	start := make(chan struct{})
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			cancelsFuncs := make([]context.CancelFunc, 0, 256)
-			defer func() {
-				for _, c := range cancelsFuncs {
-					c()
-				}
-			}()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-					_, cancel := NotifyContext(context.Background())
-					cancelsFuncs = append(cancelsFuncs, cancel)
-				}
-			}
-		}()
-	}
-
-	close(start)
-	go func() {
-		<-time.After(time.Millisecond * 5)
-		close(stop)
-	}()
-	Capture(func() { panic(testErr) })
-
-	wg.Wait()
-}
-
 func TestNotifyContext(t *testing.T) {
 	testSetup(t)
 
@@ -550,7 +454,7 @@ func TestNotifyContext(t *testing.T) {
 		Capture(func() { panic(testErr) })
 		select {
 		case <-ctx.Done():
-			e := ContextPanicError(ctx)
+			e := ContextError(ctx)
 			if e == nil {
 				t.Fatal("nil Context cause")
 			}
@@ -585,7 +489,7 @@ func TestNotifyContext(t *testing.T) {
 		Capture(func() { panic(testErr) })
 		select {
 		case <-ctx.Done():
-			e := ContextPanicError(ctx)
+			e := ContextError(ctx)
 			if e != nil {
 				t.Fatal("Cause should be nil when canceled")
 			}
@@ -610,7 +514,7 @@ func TestNotifyContext(t *testing.T) {
 		Capture(func() { panic(testErr) })
 		select {
 		case <-ctx.Done():
-			e := ContextPanicError(ctx)
+			e := ContextError(ctx)
 			if e != nil {
 				t.Fatal("Cause should be nil when canceled")
 			}
@@ -692,7 +596,7 @@ func TestNotifyContextStop(t *testing.T) {
 	for !panicked.Load() {
 	}
 	cancel()
-	e := ContextPanicError(ctx)
+	e := ContextError(ctx)
 	if e == nil {
 		t.Fatalf("cancel cause should be a %T got: %#v",
 			(*Error)(nil), context.Cause(ctx))
@@ -830,32 +734,6 @@ func TestSetOutputNilWriter(t *testing.T) {
 	fmt.Fprintln(output.Load(), "DO NOT PANIC")
 }
 
-// func TestHandlerStoppedLeaks(t *testing.T) {
-// 	testSetup(t)
-// 	numPanics := runtime.NumCPU() * 16
-// 	wg, start := generatePanics(t, numPanics, 32, int32(1))
-
-// 	chs := make([]chan *Error, 16)
-// 	for i := range chs {
-// 		chs[i] = make(chan *Error, 1)
-// 		Notify(chs[i])
-// 	}
-// 	defer func() {
-// 		for _, c := range chs {
-// 			Stop(c)
-// 		}
-// 	}()
-// 	start()
-// 	// for First() == nil {
-// 	// }
-// 	for _, c := range chs {
-// 		Stop(c)
-// 	}
-// 	wg.Wait()
-
-// 	t.Fatal(cap(handlers.stopping))
-// }
-
 func TestPanicsContext(t *testing.T) {
 	test := func(t *testing.T, parent context.Context, want string, replace func(string) string) {
 		t.Helper()
@@ -898,21 +776,23 @@ func BenchmarkHandlePanic(b *testing.B) {
 		stack:     bytes.Repeat([]byte("a"), 128),
 		recovered: false,
 	}
-	SetOutput(nil)
+	SetOutput(nopWriter{})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		handlePanic(&e, time.Second)
+		handlePanic(&e, WriteTimeout)
 	}
 }
 
 func BenchmarkCapture(b *testing.B) {
 	testSetup(b)
 	b.Run("NoPanic", func(b *testing.B) {
+		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			Capture(func() {})
 		}
 	})
 	b.Run("Panic", func(b *testing.B) {
+		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			Capture(func() { bigstack.Panic(16) })
 			// Capture(func() { panic(1) })

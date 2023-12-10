@@ -1,5 +1,5 @@
 /*
-Package panics provides helper
+Package panics provides function wrappers and a facility for
 */
 package panics
 
@@ -21,11 +21,10 @@ import (
 // that is cancelled on any panic. If propagated then this will cancel
 // any inflight requests/work helping to prepare for exit.
 
-// TODO: make public
-//
-// Maximum amount of time to wait for a panic to be written to output before
-// handling the panic.
-const writeTimeout = 100 * time.Millisecond
+// WriteTimeout is the maximum amount of time to wait for a panic to be written
+// to output before handling the panic and signalling any registered channels
+// or canceling any registered contexts.
+const WriteTimeout = 100 * time.Millisecond
 
 var (
 	panicked     atomic.Bool
@@ -57,9 +56,9 @@ func (w *writer) Write(p []byte) (int, error) {
 	return w.w.Write(p)
 }
 
-// SetOutput sets the io.Writer used to immediately write a panic and its stack
-// trace. By default panics are written to os.Stderr. Calling SetOutput with a
-// nil io.Writer disables the printing of panics.
+// SetOutput sets the [io.Writer] used to immediately write a panic and its stack
+// trace. By default panics are written to [os.Stderr]. Calling SetOutput with a
+// nil [io.Writer] disables the printing of panics.
 //
 // The [WriterFunc] type can be used to set an arbitrary logger or function as
 // the output.
@@ -86,7 +85,7 @@ func SetOutput(w io.Writer) {
 
 // SetPrintStackTrace sets if a panic and its stack trace should be immediately
 // printed when a panic is detected and returns the previous value. By default
-// this is enabled and the panic and its trace are written to os.Stderr.
+// this is enabled and the panic and its trace are written to [os.Stderr].
 //
 // [SetOutput] sets the io.Writer the panic and its stack trace are written to.
 func SetPrintStackTrace(printTrace bool) bool {
@@ -114,18 +113,19 @@ func (e *Error) Stack() []byte { return e.stack }
 // Value returns the value that panic was called with.
 func (e *Error) Value() any { return e.value }
 
-// Unwrap returns the value that triggered the panic, but only if that value
-// is an error.
-func (p *Error) Unwrap() (err error) {
-	if p.value != nil {
-		err, _ = p.value.(error)
+// Unwrap returns the value that triggered the panic if that value is an error,
+// otherwise nil is returned.
+func (e *Error) Unwrap() error {
+	if e.value == nil {
+		return nil
 	}
+	err, _ := e.value.(error)
 	return err
 }
 
 // TODO: rename to "First" or something to make it clearer that the panic
 // was the first panic since all of our panics are recovered.
-//
+
 // Recovered returns if the panic occurred after the initial panic. The panic
 // may occur in any goroutine not just the one that created the initial panic.
 func (e *Error) Recovered() bool {
@@ -277,7 +277,7 @@ func Stop(ch chan<- *Error) {
 	handlers.Unlock()
 }
 
-// WARN: do we want to handle sending on a closed channel ???
+// TODO: do we want to handle sending on a closed channel ???
 func process(e *Error) {
 	handlers.Lock()
 	defer handlers.Unlock()
@@ -354,16 +354,16 @@ type panicsCtx struct {
 }
 
 func (c *panicsCtx) stop() {
-	// WARN: this causes us to take the slow handlers.stopped path !!!
+	// NB: This causes us to take the slow handlers.stopped code path.
 	stopCtx(c)
 	c.cancel(nil)
 }
 
-// WARN: a nil return value here is a valid error !!!
-// ^^^^^^ This should not be a *huge* concern ^^^^^^
+// ContextError returns the [Error] the ctx was canceled with or nil if
+// the ctx was not canceled due to a panic.
 //
-// TODO: rename
-func ContextPanicError(ctx context.Context) *Error {
+// This is essentially a wrapper around [context.Cause].
+func ContextError(ctx context.Context) *Error {
 	if ctx == nil {
 		return nil
 	}
@@ -372,19 +372,16 @@ func ContextPanicError(ctx context.Context) *Error {
 }
 
 func (c *panicsCtx) String() string {
-	// We know that the type of c.Context is context.cancelCtx, and we know that the
-	// String method of cancelCtx returns a string that ends with ".WithCancel".
+	// We know that the type of c.Context is context.cancelCtx,
+	// and we know that the String method of cancelCtx returns
+	// a string that ends with ".WithCancel".
 	name := c.Context.(fmt.Stringer).String()
 	name = name[:len(name)-len(".WithCancel")]
 	return "panics.NotifyContext(" + name + ")"
 }
 
-// TODO: Consider adding an AfterFunc with signature:
-// 	AfterFunc(fn func(e *Error)) (stop func() bool) {}
-
-// TODO: add comment
 func handlePanic(e *Error, timeout time.Duration) {
-	// WARN: do we want to delay processing until after the panic is written ???
+	// Delay processing until writing the panic to output, if any.
 	defer process(e)
 
 	if noPrintTrace.Load() {
@@ -394,6 +391,13 @@ func handlePanic(e *Error, timeout time.Duration) {
 	if wr == nil {
 		return
 	}
+	// if timeout < 0 {
+	// 	func() {
+	// 		defer func() { _ = recover() /* ignore panic */ }()
+	// 		_, _ = e.WriteTo(wr) // ignore error
+	// 	}()
+	// 	return
+	// }
 
 	// If logging is enabled, do not block on it.
 	done := make(chan struct{})
@@ -445,7 +449,7 @@ func Capture(fn func()) {
 			delivering.Add(1)
 			defer delivering.Add(-1)
 
-			buf := make([]byte, 2048)
+			buf := make([]byte, 4096)
 			for {
 				n := runtime.Stack(buf, false)
 				if n < len(buf) {
@@ -459,7 +463,7 @@ func Capture(fn func()) {
 			if first {
 				firstPanic.Store(err)
 			}
-			handlePanic(err, writeTimeout)
+			handlePanic(err, WriteTimeout)
 		}
 	}()
 	fn()
@@ -520,8 +524,8 @@ func (w WriterFunc) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// // WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN
-// // WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN
+// TODO: consider this
+//
 // func Exit() {
 // 	if e := First(); e != nil {
 // 		// Make sure we exit and 2 is the exit code used by Go
@@ -530,25 +534,3 @@ func (w WriterFunc) Write(p []byte) (int, error) {
 // 		panic(e.Error())
 // 	}
 // 	os.Exit(0)
-// }
-
-// func CaptureCtx(parent context.Context, fn func(ctx context.Context)) (canceled bool) {
-// 	// WARN: context.WithoutCancel can break this !!!
-// 	ctx, cancel := NotifyContext(parent)
-// 	defer cancel()
-// 	if ctx.Err() != nil {
-//
-// 	}
-// 	done := make(chan struct{})
-// 	Go(func() {
-// 		defer close(done)
-// 		fn(ctx)
-// 	})
-// 	select {
-// 	case <-Done():
-// 		canceled = true
-// 		<-done
-// 	case <-done:
-// 	}
-// 	return canceled
-// }

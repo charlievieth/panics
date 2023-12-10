@@ -138,3 +138,11 @@ func ExampleWriterFunc() {
 		panic("my panic")
 	})
 }
+
+func ExampleError_writerTo() {
+	panics.SetPrintStackTrace(false)
+	ch := make(chan *panics.Error, 1)
+	panics.Notify(ch)
+	panics.Capture(func() { panic("here") })
+	(<-ch).WriteTo(os.Stdout)
+}

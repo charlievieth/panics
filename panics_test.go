@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -748,39 +749,6 @@ func TestFirstPanic(t *testing.T) {
 }
 
 func TestFirstPanicHard(t *testing.T) {
-	testSetup(t)
-	numProcs := runtime.GOMAXPROCS(-1)
-	if numProcs > runtime.NumCPU() {
-		numProcs = runtime.NumCPU()
-	}
-	if numProcs > 64 {
-		numProcs = 64
-	}
-	want := errors.New("first panic")
-	hit := 0
-	for i := 0; i < 100; i++ {
-		firstPanic.Store(nil)
-		panicked.Store(false)
-		var first atomic.Bool
-		wg, start := createGoroutines(t, numProcs, func() {
-			if first.CompareAndSwap(false, true) {
-				panic(want)
-			}
-			panic(testErr)
-		})
-		start()
-		wg.Wait()
-		if First().Value() == want {
-			hit++
-		}
-	}
-	if hit <= 90 {
-		t.Errorf("First() only returned the first panic in %d/100 tests", hit)
-	}
-	t.Logf("%d/100", hit)
-}
-
-func TestFirstPanicHarder(t *testing.T) {
 	want := errors.New("first panic")
 	test := func(t *testing.T, num int) {
 		t.Run(fmt.Sprintf("%d", num), func(t *testing.T) {
@@ -809,7 +777,13 @@ func TestFirstPanicHarder(t *testing.T) {
 			}
 		})
 	}
-	for _, n := range []int{1, 8, 64, 128, 256, 512, 1024, 8192 /*32 * 1024, 64 * 1024*/} {
+
+	sizes := []int{1, runtime.NumCPU(), runtime.NumCPU() * 2, runtime.NumCPU() * 8}
+	if runtime.GOMAXPROCS(-1) != runtime.NumCPU() {
+		sizes = append(sizes, runtime.GOMAXPROCS(-1), runtime.GOMAXPROCS(-1)*2)
+		sort.Ints(sizes)
+	}
+	for _, n := range sizes {
 		test(t, n)
 	}
 }

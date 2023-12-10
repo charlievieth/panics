@@ -5,7 +5,6 @@ package panics
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -74,7 +73,9 @@ func SetOutput(w io.Writer) {
 		output.Store(&stderrWriter)
 	default:
 		// Handle interface shenanigans where w is non-nil despite the
-		// underlying value being nil.
+		// underlying value being nil. This is a programming error and
+		// normally should be dealt with harshly (panic), but considering
+		// that we use this to handle panics we need to play it safe here.
 		if v := reflect.ValueOf(w); v.Kind() == reflect.Ptr && v.IsNil() {
 			output.Store(nil)
 		} else {
@@ -100,39 +101,26 @@ type Error struct {
 	recovered bool
 }
 
-// Error returns the value panic() was called with followed by a newline and
-// the stack trace captured at the site of the panic.
+// Error returns the value panic was called with followed by two newlines and
+// the stack trace captured at the site of the panic. The returned string is
+// not prefixed with "panic: ".
 func (e *Error) Error() string {
 	return fmt.Sprintf("%v\n\n%s", e.value, e.stack)
 }
 
-// Stack returns the stack trace that was captured during program panic.
+// Stack returns the stack trace that was captured at the site of the panic.
 func (e *Error) Stack() []byte { return e.stack }
 
 // Value returns the value that panic was called with.
 func (e *Error) Value() any { return e.value }
 
-// TODO: DELETE
-//
-// WARN: we might not have panicked with an [error] so do we want this??
-func (p *Error) Unwrap() error {
-	// TODO: maybe only unwrap if value is an error
-	if p.value == nil {
-		return nil
+// Unwrap returns the value that triggered the panic, but only if that value
+// is an error.
+func (p *Error) Unwrap() (err error) {
+	if p.value != nil {
+		err, _ = p.value.(error)
 	}
-	switch v := p.value.(type) {
-	case error:
-		return v
-	case string:
-		return errors.New(v)
-	case []byte:
-		// Not sure why you'd panic with a []byte but handle it.
-		return errors.New(string(v))
-	case fmt.Stringer:
-		return errors.New(v.String())
-	default:
-		return fmt.Errorf("%v", v)
-	}
+	return err
 }
 
 // TODO: rename to "First" or something to make it clearer that the panic
@@ -157,13 +145,6 @@ func (e *Error) WriteTo(w io.Writer) (int64, error) {
 	n, err := fmt.Fprintf(w, "panic: %v%s\n\n%s\n", e.value, suffix, e.stack)
 	return int64(n), err
 }
-
-/*
-The returned Error is almost always that of the first captured panic.
-If more than runtime.GOMAXPROCS panics happen at the exact same time the panic
-returned by First only has a ~97% chance of being the first panic (this may
-be Arch specific).
-*/
 
 // First returns the [Error] for the first captured panic or nil if no panics were
 // captured.
@@ -194,8 +175,9 @@ var handlers struct {
 	m map[chan<- *Error]struct{}
 	// Map of context.Contexts to be canceled when a panic is captured
 	mctx map[*panicsCtx]struct{}
-
-	// TODO: document why we have these
+	// stopping* are used to handle pending panics during a call to stop*.
+	// Slices not maps because the entries here are very short-lived and
+	// are small in size.
 	stopping    []chan<- *Error
 	stoppingCtx []*panicsCtx
 }
@@ -273,10 +255,12 @@ func panicsWaitUntilIdle() {
 // When Stop returns, it is guaranteed that c will receive no more panics.
 func Stop(ch chan<- *Error) {
 	handlers.Lock()
-	if _, ok := handlers.m[ch]; ok {
-		delete(handlers.m, ch)
-		handlers.stopping = append(handlers.stopping, ch)
+	if _, ok := handlers.m[ch]; !ok {
+		handlers.Unlock()
+		return
 	}
+	delete(handlers.m, ch)
+	handlers.stopping = append(handlers.stopping, ch) // handle pending panics
 	handlers.Unlock()
 
 	panicsWaitUntilIdle()
@@ -536,17 +520,17 @@ func (w WriterFunc) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN
-// WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN
-func Exit() {
-	if e := First(); e != nil {
-		// Make sure we exit and 2 is the exit code used by Go
-		// when a panic occurs this call should be unreachable.
-		defer os.Exit(2)
-		panic(e.Error())
-	}
-	os.Exit(0)
-}
+// // WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN
+// // WARN WARN WARN WARN WARN WARN WARN WARN WARN WARN
+// func Exit() {
+// 	if e := First(); e != nil {
+// 		// Make sure we exit and 2 is the exit code used by Go
+// 		// when a panic occurs this call should be unreachable.
+// 		defer os.Exit(2)
+// 		panic(e.Error())
+// 	}
+// 	os.Exit(0)
+// }
 
 // func CaptureCtx(parent context.Context, fn func(ctx context.Context)) (canceled bool) {
 // 	// WARN: context.WithoutCancel can break this !!!

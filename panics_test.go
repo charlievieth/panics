@@ -63,6 +63,25 @@ func resetHandlers(t testing.TB) {
 }
 
 func testSetup(t testing.TB) {
+	goroutines := runtime.NumGoroutine()
+	t.Cleanup(func() {
+		// Make sure all tests cleanup their goroutines
+		now := time.Now()
+		for i := 0; time.Since(now) <= time.Second; i++ {
+			n := runtime.NumGoroutine()
+			if n <= goroutines {
+				return
+			}
+			runtime.Gosched() // let goroutines exit
+			if i >= 10 {
+				// Stop busy spinning and actually sleep between checks
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+		if n := runtime.NumGoroutine(); n > goroutines {
+			t.Errorf("leaked %d goroutines", n-goroutines)
+		}
+	})
 	SetOutput(nil)
 	resetHandlers(t)
 	t.Cleanup(func() {
@@ -841,8 +860,10 @@ func TestFirstPanicHard(t *testing.T) {
 		1,
 		runtime.NumCPU(),
 		runtime.NumCPU() * 2,
-		runtime.NumCPU() * 8,
-		runtime.NumCPU() * 16,
+	}
+	if !testing.Short() {
+		sizes = append(sizes, runtime.NumCPU()*8)
+		sizes = append(sizes, runtime.NumCPU()*16)
 	}
 	if runtime.GOMAXPROCS(-1) != runtime.NumCPU() {
 		sizes = append(sizes, runtime.GOMAXPROCS(-1), runtime.GOMAXPROCS(-1)*2)

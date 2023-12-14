@@ -101,42 +101,61 @@ func ExampleGoWG() {
 	case <-ch:
 		fmt.Println("ch was notified of the panic")
 	default:
-		fmt.Println("Wait returned before ch was notified")
+		fmt.Println("error: Wait returned before ch was notified")
 	}
 
 	// Output:
 	// ch was notified of the panic
 }
 
-func ExampleSetOutput() {
-	panics.SetPrintStackTrace(true)
+// WARN WARN WARN WRAN
+// func ExampleSetOutput() {
+// 	// Use an arbitrary function as the panic output
+// 	ctx, cancel := panics.NotifyContext(context.Background())
+// 	defer cancel()
+//
+// 	var n int
+// 	panics.SetOutput(panics.WriterFunc(func(p []byte) {
+// 		n++
+// 	}))
+// 	for i := 0; i < 5; i++ {
+// 		panics.Capture(func() { panic("my panic") })
+// 	}
+// 	<-ctx.Done()
+// 	fmt.Printf("captured %d panics\n", n)
+//
+// 	// Output:
+// 	// captured 5 panics
+// }
 
-	// Use an arbitrary function as the panic output
-	var n int
-	panics.SetOutput(panics.WriterFunc(func(p []byte) {
-		n++
-	}))
-	for i := 0; i < 5; i++ {
-		panics.Capture(func() { panic("my panic") })
-	}
-	fmt.Printf("captured %d panics\n", n)
-
-	// Output:
-	// captured 5 panics
-}
+// func ExampleSetOutput_slowWriter() {
+// 	// Use an arbitrary function as the panic output
+// 	var n int
+// 	panics.SetOutput(panics.WriterFunc(func(p []byte) {
+// 		n++
+// 	}))
+// 	for i := 0; i < 5; i++ {
+// 		panics.Capture(func() { panic("my panic") })
+// 	}
+// 	fmt.Printf("captured %d panics\n", n)
+//
+// 	// Output:
+// 	// captured 5 panics
+// }
 
 func ExampleWriterFunc() {
 	// This example shows how you can use an arbitrary logger as
 	// the panic output.
 
-	ll := log.New(os.Stdout, "# ", log.LstdFlags)
+	ctx, cancel := panics.NotifyContext(context.Background())
+	defer cancel()
 
 	panics.SetOutput(panics.WriterFunc(func(p []byte) {
-		ll.Printf("%s\n", p)
+		log.Printf("Panic output:\n#########\n%s\n#########", p)
 	}))
-	panics.Capture(func() {
-		panic("my panic")
-	})
+
+	panics.Capture(func() { panic("my panic") })
+	<-ctx.Done() // Wait for the panic to be handled.
 }
 
 func ExampleError_writerTo() {

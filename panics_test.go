@@ -528,6 +528,157 @@ func TestNotifyContext(t *testing.T) {
 
 		testNotifyStopped(t, ctx, time.Millisecond*100)
 	})
+
+	t.Run("NilContext", func(t *testing.T) {
+		defer func() {
+			if e := recover(); e == nil {
+				t.Fatal("NotifyContext(nil) should panic")
+			}
+		}()
+		NotifyContext(nil)
+	})
+}
+
+func contextCancelled(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func TestNotifyContextReuse(t *testing.T) {
+	testSetup(t)
+	ctx1, cancel1 := NotifyContext(context.Background())
+	// Put a non *panicsCtx in the middle to make
+	// sure our Value() method really works.
+	ctx2, cancel2 := context.WithCancel(ctx1)
+	ctx3, cancel3 := NotifyContext(ctx2)
+	ctx4, cancel4 := context.WithCancel(ctx3)
+	cancel3()
+	if !contextCancelled(ctx4) {
+		t.Fatal("failed to cancel ctx4")
+	}
+	t.Cleanup(func() {
+		for _, c := range []context.CancelFunc{cancel1, cancel2, cancel3, cancel4} {
+			c()
+		}
+	})
+	if n := len(handlers.mctx); n != 1 {
+		t.Fatalf("len(handlers.mctx) = %d; want: %d", n, 1)
+	}
+	cancel2()
+	if !contextCancelled(ctx2) {
+		t.Fatal("failed to cancel ctx2")
+	}
+	if !contextCancelled(ctx3) {
+		t.Fatal("failed to cancel ctx3")
+	}
+	if contextCancelled(ctx1) {
+		t.Fatal("canceled ctx2")
+	}
+	cancel1()
+	if !contextCancelled(ctx1) {
+		t.Fatal("failed to cancel ctx1")
+	}
+	if !contextCancelled(ctx2) {
+		t.Fatal("failed to cancel ctx2")
+	}
+}
+
+func TestNotifyContextReuseNotifiedParent(t *testing.T) {
+	testSetup(t)
+
+	ctx1, cancel1 := NotifyContext(context.Background())
+	defer cancel1()
+
+	Capture(func() { panic(testErr) })
+	if !contextCancelled(ctx1) {
+		t.Fatal("failed to cancel context")
+	}
+
+	// ctx2 should not be canceled because the panic that canceled
+	// ctx1 occurs before the creation of ctx2
+	ctx2, cancel2 := NotifyContext(ctx1)
+	defer cancel2()
+
+	// ctx1 has been removed from the handlers and ctx2 was not
+	// registered because it is a child of ctx1
+	if n := len(handlers.mctx); n != 0 {
+		t.Fatalf("len(handlers.mctx) = %d; want: %d", n, 1)
+	}
+	if !contextCancelled(ctx2) {
+		t.Fatal("failed to cancel child context")
+	}
+}
+
+// Test that when the parent is already registered with NotifyContext we
+// don't register it but instead return a copy.
+func TestNotifyContextAllocs(t *testing.T) {
+	testSetup(t)
+	ctx, cancel := NotifyContext(context.Background())
+	t.Cleanup(cancel)
+	allocs := testing.AllocsPerRun(100, func() {
+		_, cancel := NotifyContext(ctx)
+		cancel()
+	})
+	want := 3.0
+	if allocs != want {
+		t.Fatalf("Unexpected number of allocations, got %.2f, want %.2f", allocs, want)
+	}
+}
+
+func TestNotifyContextGoroutines(t *testing.T) {
+	testSetup(t)
+
+	ctx, cancel := NotifyContext(context.Background())
+	t.Cleanup(cancel)
+
+	goroutines := runtime.NumGoroutine()
+	cancelFuncs := make([]context.CancelFunc, 100)
+	for i := range cancelFuncs {
+		_, cancelFuncs[i] = NotifyContext(ctx)
+	}
+	t.Cleanup(func() {
+		for _, c := range cancelFuncs {
+			c()
+		}
+	})
+
+	// Since the contexts we're creating are the children of a cancelCtx
+	// we should not be creating an goroutines.
+	//
+	// Use a loop since we need to handle the case of other tests leaking
+	// a goroutine.
+	tick := time.NewTicker(10 * time.Millisecond)
+	for i := 0; i < 100; i++ {
+		if runtime.NumGoroutine() <= goroutines {
+			return
+		}
+		<-tick.C
+		runtime.GC()
+	}
+	if n := runtime.NumGoroutine(); n > goroutines {
+		t.Errorf("runtime.NumGoroutine() = %d; want: %d\n\n## Stack:\n%s\n##",
+			n, goroutines, stackTrace())
+	}
+}
+
+func stackTrace() []byte {
+	buf := make([]byte, 4096)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	return buf
 }
 
 // createGoroutines creates count goroutines that will wait until the returned
@@ -652,25 +803,29 @@ func TestFirstPanic(t *testing.T) {
 	}
 }
 
+// TODO: rename
 func TestFirstPanicHard(t *testing.T) {
-	want := errors.New("first panic")
+	// Stress test how often the panic returned by First is actually
+	// the first panic that occured. We don't control the runtime so
+	// if multiple panics occur at the exact same time the first
+	// panic that we handle might not be exactly the first one that
+	// occured.
+
 	test := func(t *testing.T, num int) {
 		t.Run(fmt.Sprintf("%d", num), func(t *testing.T) {
 			testSetup(t)
 			hit := 0
+			var u atomic.Uint32
 			for i := 0; i < 100; i++ {
 				firstPanic.Store(nil)
 				panicked.Store(false)
-				var first atomic.Bool
+				u.Store(0)
 				wg, start := createGoroutines(t, num, func() {
-					if first.CompareAndSwap(false, true) {
-						panic(want)
-					}
-					panic(testErr)
+					panic(u.Swap(1))
 				})
 				start()
 				wg.Wait()
-				if First().Value() == want {
+				if First().Value().(uint32) == 0 {
 					hit++
 				}
 			}
@@ -682,7 +837,13 @@ func TestFirstPanicHard(t *testing.T) {
 		})
 	}
 
-	sizes := []int{1, runtime.NumCPU(), runtime.NumCPU() * 2, runtime.NumCPU() * 8}
+	sizes := []int{
+		1,
+		runtime.NumCPU(),
+		runtime.NumCPU() * 2,
+		runtime.NumCPU() * 8,
+		runtime.NumCPU() * 16,
+	}
 	if runtime.GOMAXPROCS(-1) != runtime.NumCPU() {
 		sizes = append(sizes, runtime.GOMAXPROCS(-1), runtime.GOMAXPROCS(-1)*2)
 		sort.Ints(sizes)
@@ -734,6 +895,16 @@ func TestSetOutputNilWriter(t *testing.T) {
 	fmt.Fprintln(output.Load(), "DO NOT PANIC")
 }
 
+func TestSetOutputPanickingWriter(t *testing.T) {
+	testSetup(t)
+
+	// Make sure we ignore any panics while writing
+	SetOutput(WriterFunc(func(p []byte) {
+		panic("nope 1")
+	}))
+	Capture(func() { panic("panic") })
+}
+
 func TestPanicsContext(t *testing.T) {
 	test := func(t *testing.T, parent context.Context, want string, replace func(string) string) {
 		t.Helper()
@@ -764,68 +935,48 @@ func TestPanicsContext(t *testing.T) {
 			ReplaceAllString(s, "")
 	}
 	test(t, ctx3, "panics.NotifyContext(context.Background.WithCancel.WithDeadline)", replace)
+
+	{
+		// Make sure that our short-circuiting of canceled parent contexts
+		// does not change the string representation.
+		parent, cancel := NotifyContext(context.Background())
+		c1, f1 := NotifyContext(parent)
+		cancel()
+		c2, f2 := NotifyContext(parent)
+		defer f1()
+		defer f2()
+		s1 := c1.(fmt.Stringer).String()
+		s2 := c2.(fmt.Stringer).String()
+		if s1 != s2 {
+			t.Errorf("(%T).String() = %q; (%T).String() = %q", c1, s1, c2, s2)
+		}
+	}
 }
 
-func BenchmarkHandlePanic(b *testing.B) {
-	b.Cleanup(func() {
-		// WARN: we should not be doing this in cleanup !!
-		testSetup(b) // replace context on exit
-	})
-	e := Error{
-		value:     testErr,
-		stack:     bytes.Repeat([]byte("a"), 128),
-		recovered: false,
-	}
-	SetOutput(nopWriter{})
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		handlePanic(&e, WriteTimeout)
-	}
-}
-
-func BenchmarkCapture(b *testing.B) {
-	testSetup(b)
-	b.Run("NoPanic", func(b *testing.B) {
-		b.ReportAllocs()
+func BenchmarkNotifyContext(b *testing.B) {
+	b.Run("NoParent", func(b *testing.B) {
+		testSetup(b)
 		for i := 0; i < b.N; i++ {
-			Capture(func() {})
-		}
-	})
-	b.Run("Panic", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			Capture(func() { bigstack.Panic(16) })
-			// Capture(func() { panic(1) })
-		}
-	})
-}
-
-// TODO: this is only here for my own interest
-func BenchmarkStackTrace(b *testing.B) {
-	b.ReportAllocs()
-	stack := func(all bool) []byte {
-		buf := make([]byte, 2048)
-		for {
-			// TODO: cap stack size
-			n := runtime.Stack(buf, all)
-			if n < len(buf) {
-				buf = buf[:n]
-				break
-			}
-			buf = append(buf, make([]byte, len(buf))...)
-		}
-		return buf
-	}
-	f := bigstack.Func(16, func() {
-		_ = stack(false)
-	})
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
+			_, f := NotifyContext(context.Background())
 			f()
 		}
 	})
-	// for i := 0; i < b.N; i++ {
-	// 	f()
-	// 	// _ = stack(false)
-	// }
+	b.Run("ParentRegistered", func(b *testing.B) {
+		testSetup(b)
+		parent, cancel := NotifyContext(context.Background())
+		defer cancel()
+		for i := 0; i < b.N; i++ {
+			_, f := NotifyContext(parent)
+			f()
+		}
+	})
+	b.Run("ParentCanceled", func(b *testing.B) {
+		testSetup(b)
+		parent, cancel := NotifyContext(context.Background())
+		cancel()
+		for i := 0; i < b.N; i++ {
+			_, f := NotifyContext(parent)
+			f()
+		}
+	})
 }

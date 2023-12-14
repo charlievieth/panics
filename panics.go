@@ -13,9 +13,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
-// TODO: add a way to scope a Context to a single call
+// TODO(charlie): future work
+//
+// 	* Add a way to scope a Context to a single call
+// 	* Add an internal Error logger to report write errors, timeouts, or
+// 	  any other error that we can't directly surface to the user
+//
 
 // Explain the reasoning behind NotifyContext, which provides a context
 // that is cancelled on any panic. If propagated then this will cancel
@@ -46,6 +52,9 @@ var _ = func() struct{} {
 // can use it with atomic.Pointer (output var). A nil *writer is safe
 // to use and makes writes a no-op.
 type writer struct {
+	// TODO(charlie): Consider adding a mutex to allow users to supply
+	// non-thread-safe writers and because it would allow for us to
+	// wait until writes complete.
 	w io.Writer
 }
 
@@ -56,14 +65,22 @@ func (w *writer) Write(p []byte) (int, error) {
 	return w.w.Write(p)
 }
 
-// SetOutput sets the [io.Writer] used to immediately write a panic and its stack
-// trace. By default panics are written to [os.Stderr]. Calling SetOutput with a
-// nil [io.Writer] disables the printing of panics.
+// TODO: wrap the writer in a mutex so that we can wait for writes to finish
+// and to make writers thread-safe
+
+// SetOutput sets the [io.Writer] that a captured panic and its stack trace are
+// immediately written to with [Error.WriteTo]. The format is the same as an
+// uncaught panic. The Writer must be safe for concurrent use. By default,
+// panics are written to [os.Stderr].
+//
+// If writing the panic takes more that [WriteTimeout] all registered channels
+// and contexts will be notified / canceled before the write completes.
+//
+// Calling SetOutput with a nil [io.Writer] or calling [SetPrintStackTrace] with
+// false disables the printing of panics.
 //
 // The [WriterFunc] type can be used to set an arbitrary logger or function as
 // the output.
-//
-// If [SetPrintStackTrace] is set to false then panics will not be written to w.
 func SetOutput(w io.Writer) {
 	switch {
 	case w == nil || w == io.Discard:
@@ -83,6 +100,8 @@ func SetOutput(w io.Writer) {
 	}
 }
 
+// TODO: consider renaming to "PrintStackTrace"
+
 // SetPrintStackTrace sets if a panic and its stack trace should be immediately
 // printed when a panic is detected and returns the previous value. By default
 // this is enabled and the panic and its trace are written to [os.Stderr].
@@ -96,7 +115,7 @@ func SetPrintStackTrace(printTrace bool) bool {
 // with the stack trace during the execution of given function.
 type Error struct {
 	value     any
-	stack     []byte
+	stack     string
 	recovered bool
 }
 
@@ -108,7 +127,7 @@ func (e *Error) Error() string {
 }
 
 // Stack returns the stack trace that was captured at the site of the panic.
-func (e *Error) Stack() []byte { return e.stack }
+func (e *Error) Stack() string { return e.stack }
 
 // Value returns the value that panic was called with.
 func (e *Error) Value() any { return e.value }
@@ -146,8 +165,8 @@ func (e *Error) WriteTo(w io.Writer) (int64, error) {
 	return int64(n), err
 }
 
-// First returns the [Error] for the first captured panic or nil if no panics were
-// captured.
+// First returns the [Error] for the first captured panic or nil if no panics
+// were captured.
 //
 // If multiple panics occur at the exact same time, there is a very slight
 // chance (<1-3%) that the returned [Error] may not be from the first panic.
@@ -308,6 +327,8 @@ func process(e *Error) {
 	}
 }
 
+// TODO: allow users to configure a deadline for canceled contexts ???
+
 // NotifyContext returns a copy of the parent context that is marked done
 // (its Done channel is closed) when any panic is captured, when the parent
 // context's Done channel is closed, or the returned stop function is called,
@@ -328,6 +349,14 @@ func process(e *Error) {
 // so users should check the cancel cause with [context.Cause] to see if the
 // context was canceled by a panic after stop returns.
 func NotifyContext(parent context.Context) (_ context.Context, stop context.CancelFunc) {
+	if parent == nil {
+		panic("panics: cannot create context from nil parent")
+	}
+	if parent.Value(&panicsCtxKey) == &panicsCtxKey {
+		// Parent context is registered with NotifyContext.
+		ctx, cancel := context.WithCancel(parent)
+		return &panicsCtx{Context: ctx}, cancel
+	}
 	ctx, causeFn := context.WithCancelCause(parent)
 	c := &panicsCtx{
 		Context: ctx,
@@ -348,9 +377,18 @@ func NotifyContext(parent context.Context) (_ context.Context, stop context.Canc
 	return c, c.stop
 }
 
+var panicsCtxKey int
+
 type panicsCtx struct {
 	context.Context
 	cancel context.CancelCauseFunc
+}
+
+func (c *panicsCtx) Value(key any) any {
+	if key == &panicsCtxKey {
+		return &panicsCtxKey
+	}
+	return c.Context.Value(key)
 }
 
 func (c *panicsCtx) stop() {
@@ -391,17 +429,10 @@ func handlePanic(e *Error, timeout time.Duration) {
 	if wr == nil {
 		return
 	}
-	// if timeout < 0 {
-	// 	func() {
-	// 		defer func() { _ = recover() /* ignore panic */ }()
-	// 		_, _ = e.WriteTo(wr) // ignore error
-	// 	}()
-	// 	return
-	// }
 
-	// If logging is enabled, do not block on it.
+	// If logging is enabled, do not indefinitely block on it.
 	done := make(chan struct{})
-	go func(wr io.Writer, done chan<- struct{}) {
+	go func(wr *writer, done chan<- struct{}) {
 		defer func() {
 			close(done)
 			_ = recover() // ignore panic
@@ -412,6 +443,7 @@ func handlePanic(e *Error, timeout time.Duration) {
 	to := time.NewTimer(timeout)
 	select {
 	case <-to.C:
+		// Timed out waiting for write to complete.
 	case <-done:
 		to.Stop()
 	}
@@ -459,7 +491,11 @@ func Capture(fn func()) {
 				buf = make([]byte, 2*len(buf))
 			}
 
-			err := &Error{value: e, stack: buf, recovered: !first}
+			err := &Error{
+				value:     e,
+				stack:     unsafe.String(unsafe.SliceData(buf), len(buf)),
+				recovered: !first,
+			}
 			if first {
 				firstPanic.Store(err)
 			}
@@ -487,7 +523,8 @@ func CaptureValues[T1, T2 any](fn func() (T1, T2)) (v1 T1, v2 T2) {
 
 // Go runs func fn in a goroutine using [Capture].
 //
-// Note: Deferred functions in fn are called before the panic handler returns.
+// Note: Deferred functions in fn are called before the panic handler (see
+// the [Capture] docs for an explanation).
 func Go(fn func()) { go Capture(fn) }
 
 // GoWG increments the WaitGroup counter, runs func fn in a goroutine using
@@ -495,7 +532,7 @@ func Go(fn func()) { go Capture(fn) }
 // in fn will be handled before the WaitGroup is decremented.
 //
 // This function is provided because decrementing the WaitGroup counter in
-// fn will occur before the panic handler returns.
+// fn will occur before the panic handler.
 func GoWG(wg *sync.WaitGroup, fn func()) {
 	if wg == nil {
 		panic("panics: cannot call GoWG with nil sync.WaitGroup")

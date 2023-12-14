@@ -84,6 +84,23 @@ func ExampleCapture_waitGroup() {
 }
 
 func ExampleGoWG() {
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		i := i
+		panics.GoWG(&wg, func() {
+			fmt.Println(i)
+		})
+	}
+	wg.Wait()
+
+	// Unordered output:
+	// 0
+	// 1
+	// 2
+	// 3
+}
+
+func ExampleGoWG_panic() {
 	panics.SetPrintStackTrace(false)
 
 	ch := make(chan *panics.Error, 1)

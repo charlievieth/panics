@@ -352,8 +352,9 @@ func NotifyContext(parent context.Context) (_ context.Context, stop context.Canc
 	if parent == nil {
 		panic("panics: cannot create context from nil parent")
 	}
-	if parent.Value(&panicsCtxKey) == &panicsCtxKey {
-		// Parent context is registered with NotifyContext.
+	if parent.Done() != nil && parent.Value(&panicsCtxKey) == &panicsCtxKey {
+		// Parent context is registered with NotifyContext
+		// and was not created with context.WithoutCancel.
 		ctx, cancel := context.WithCancel(parent)
 		return &panicsCtx{Context: ctx}, cancel
 	}

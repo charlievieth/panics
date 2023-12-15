@@ -459,9 +459,8 @@ func testNotifyStopped(t *testing.T, ctx context.Context, timeout time.Duration)
 }
 
 func TestNotifyContext(t *testing.T) {
-	testSetup(t)
-
 	t.Run("Panic", func(t *testing.T) {
+		testSetup(t)
 
 		// WARN: fixing the WaitGroup race means we might leave a goroutine
 		// around for a very brief amount of time
@@ -502,6 +501,8 @@ func TestNotifyContext(t *testing.T) {
 	})
 
 	t.Run("Canceled", func(t *testing.T) {
+		testSetup(t)
+
 		ctx, cancel := NotifyContext(context.Background())
 		cancel() // Cancel immediately
 
@@ -524,6 +525,8 @@ func TestNotifyContext(t *testing.T) {
 	})
 
 	t.Run("ParentCanceled", func(t *testing.T) {
+		testSetup(t)
+
 		parent, cancel := context.WithCancel(context.Background())
 		ctx, cancel1 := NotifyContext(parent)
 		defer cancel1()
@@ -546,6 +549,27 @@ func TestNotifyContext(t *testing.T) {
 		}
 
 		testNotifyStopped(t, ctx, time.Millisecond*100)
+	})
+
+	t.Run("WithoutCancel", func(t *testing.T) {
+		testSetup(t)
+
+		parent, cancel1 := NotifyContext(context.Background())
+		defer cancel1()
+
+		// If the parent is already registed we don't register the child
+		// (since the parent will cancel it), WithoutCancel breaks this
+		// so test that we handle it.
+		ctx, cancel2 := NotifyContext(context.WithoutCancel(parent))
+		defer cancel2()
+
+		Capture(func() { panic(testErr) })
+		if !contextCancelled(ctx) {
+			t.Error("failed to notify child context created with context.WithoutCancel")
+		}
+		if !contextCancelled(parent) {
+			t.Fatal("failed to notify parent context")
+		}
 	})
 
 	t.Run("NilContext", func(t *testing.T) {

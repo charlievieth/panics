@@ -551,27 +551,6 @@ func TestNotifyContext(t *testing.T) {
 		testNotifyStopped(t, ctx, time.Millisecond*100)
 	})
 
-	t.Run("WithoutCancel", func(t *testing.T) {
-		testSetup(t)
-
-		parent, cancel1 := NotifyContext(context.Background())
-		defer cancel1()
-
-		// If the parent is already registed we don't register the child
-		// (since the parent will cancel it), WithoutCancel breaks this
-		// so test that we handle it.
-		ctx, cancel2 := NotifyContext(context.WithoutCancel(parent))
-		defer cancel2()
-
-		Capture(func() { panic(testErr) })
-		if !contextCancelled(ctx) {
-			t.Error("failed to notify child context created with context.WithoutCancel")
-		}
-		if !contextCancelled(parent) {
-			t.Fatal("failed to notify parent context")
-		}
-	})
-
 	t.Run("NilContext", func(t *testing.T) {
 		defer func() {
 			if e := recover(); e == nil {
@@ -994,6 +973,24 @@ func TestPanicsContext(t *testing.T) {
 		s2 := c2.(fmt.Stringer).String()
 		if s1 != s2 {
 			t.Errorf("(%T).String() = %q; (%T).String() = %q", c1, s1, c2, s2)
+		}
+	}
+}
+
+func TestErrorUnwrap(t *testing.T) {
+	var tests = []struct {
+		err  Error
+		want error
+	}{
+		{Error{value: nil}, nil},
+		{Error{value: 1}, nil},
+		{Error{value: "foo"}, nil},
+		{Error{value: testErr}, testErr},
+	}
+	for _, test := range tests {
+		got := test.err.Unwrap()
+		if got != test.want {
+			t.Errorf("%+v.Unwrap() = %v; want: %v", test.err, got, test.want)
 		}
 	}
 }

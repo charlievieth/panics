@@ -114,15 +114,16 @@ func SetPrintStackTrace(printTrace bool) bool {
 // A Error is an arbitrary value recovered from a panic
 // with the stack trace during the execution of given function.
 type Error struct {
-	value     any
-	stack     string
-	recovered bool
+	value     any    // value panic() was called with
+	stack     string // stack trace captured at the site of the panic
+	recovered bool   // true if this is not the first panic
 }
 
 // Error returns the value panic was called with followed by two newlines and
 // the stack trace captured at the site of the panic. The returned string is
 // not prefixed with "panic: ".
 func (e *Error) Error() string {
+	// TODO: consider adding " [recovered]" suffix
 	return fmt.Sprintf("%v\n\n%s", e.value, e.stack)
 }
 
@@ -352,11 +353,13 @@ func NotifyContext(parent context.Context) (_ context.Context, stop context.Canc
 	if parent == nil {
 		panic("panics: cannot create context from nil parent")
 	}
-	if parent.Done() != nil && parent.Value(&panicsCtxKey) == &panicsCtxKey {
-		// Parent context is registered with NotifyContext
-		// and was not created with context.WithoutCancel.
-		ctx, cancel := context.WithCancel(parent)
-		return &panicsCtx{Context: ctx}, cancel
+	if p, _ := parent.Value(&panicsCtxKey).(*panicsCtx); p != nil {
+		if done := p.Done(); done != nil && done == parent.Done() {
+			// Parent context is registered with NotifyContext
+			// and was not created with context.WithoutCancel.
+			ctx, cancel := context.WithCancel(parent)
+			return &panicsCtx{Context: ctx}, cancel
+		}
 	}
 	ctx, causeFn := context.WithCancelCause(parent)
 	c := &panicsCtx{
@@ -387,7 +390,7 @@ type panicsCtx struct {
 
 func (c *panicsCtx) Value(key any) any {
 	if key == &panicsCtxKey {
-		return &panicsCtxKey
+		return c
 	}
 	return c.Context.Value(key)
 }

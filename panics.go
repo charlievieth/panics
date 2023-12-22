@@ -196,8 +196,7 @@ var handlers struct {
 	// Map of context.Contexts to be canceled when a panic is captured
 	mctx map[*panicsCtx]struct{}
 	// stopping* are used to handle pending panics during a call to stop*.
-	// Slices not maps because the entries here are very short-lived and
-	// are small in size.
+	// Not a map because entries are few and live here only very briefly.
 	stopping    []chan<- *Error
 	stoppingCtx []*panicsCtx
 }

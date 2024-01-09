@@ -53,6 +53,23 @@ func ExampleNotifyContext() {
 	// my panic
 }
 
+func ExampleCapture() {
+	panics.SetPrintStackTrace(false) // quiet output
+
+	ch := make(chan *panics.Error, 1)
+	panics.Notify(ch)
+
+	panics.Capture(func() {
+		panic("my panic")
+	})
+
+	e := <-ch
+	fmt.Println(e.Value())
+
+	// Output:
+	// my panic
+}
+
 func ExampleCapture_waitGroup() {
 	panics.SetPrintStackTrace(false)
 
@@ -81,6 +98,56 @@ func ExampleCapture_waitGroup() {
 
 	// Output:
 	// canceled
+}
+
+func ExampleCaptureValue() {
+	panics.SetPrintStackTrace(false) // quiet output
+
+	ch := make(chan *panics.Error, 1)
+	panics.Notify(ch)
+
+	i, panicked := panics.CaptureValue(func() int {
+		return 1
+	})
+	fmt.Printf("i: %d panicked: %t\n", i, panicked)
+
+	// Output:
+	// i: 1 panicked: false
+}
+
+// TODO: fix the interface so that this does not suck
+//
+// func ExampleCaptureValue_panic() {
+// 	panics.SetPrintStackTrace(false) // quiet output
+//
+// 	ch := make(chan *panics.Error, 1)
+// 	panics.Notify(ch)
+//
+// 	// WARN: this is not very ergonomic because it's hard to
+// 	// tell if fn() panicked which could lead to use using a
+// 	// nil value and triggering another panic !!!
+// 	i := panics.CaptureValue(func() *int {
+// 		panic("my panic")
+// 	})
+// 	fmt.Println(i)
+//
+// 	// Output:
+// 	// FIXME
+// }
+
+func ExampleCaptureValues() {
+	panics.SetPrintStackTrace(false) // quiet output
+
+	ch := make(chan *panics.Error, 1)
+	panics.Notify(ch)
+
+	i, err, panicked := panics.CaptureValues(func() (int, error) {
+		return 1, nil
+	})
+	fmt.Println(i, err, panicked)
+
+	// Output:
+	// 1 <nil> false
 }
 
 func ExampleGoWG() {
@@ -177,8 +244,11 @@ func ExampleWriterFunc() {
 
 func ExampleError_writerTo() {
 	panics.SetPrintStackTrace(false)
+
 	ch := make(chan *panics.Error, 1)
 	panics.Notify(ch)
 	panics.Capture(func() { panic("here") })
-	(<-ch).WriteTo(os.Stdout)
+
+	e := <-ch
+	e.WriteTo(os.Stdout)
 }

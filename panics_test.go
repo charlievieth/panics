@@ -128,7 +128,7 @@ func testCapturePanic(t *testing.T, fn func(call func())) {
 }
 
 func TestCapturePanic(t *testing.T) {
-	testCapturePanic(t, Capture)
+	testCapturePanic(t, func(fn func()) { Capture(fn) })
 }
 
 func TestGoPanic(t *testing.T) {
@@ -156,20 +156,20 @@ func TestGoWGNilWaitGroup(t *testing.T) {
 
 func TestCaptureValue(t *testing.T) {
 	testSetup(t)
-	i := CaptureValue(func() int {
+	i, didPanic := CaptureValue(func() int {
 		return 1
 	})
-	if i != 1 {
-		t.Errorf("CaptureValue() = %d; want: %d", i, 1)
+	if i != 1 || didPanic {
+		t.Errorf("CaptureValue() = %d, %t; want: %d, %t", i, didPanic, 1, false)
 	}
 	ctx, cancel := NotifyContext(context.Background())
 	defer cancel()
-	j := CaptureValue(func() int {
+	j, didPanic := CaptureValue(func() int {
 		panic("here")
 		// unreachable
 	})
-	if j != 0 {
-		t.Errorf("CaptureValue() = %d; want: %d", j, 0)
+	if j != 0 || !didPanic {
+		t.Errorf("CaptureValue() = %d, %t; want: %d, %t", j, didPanic, 0, true)
 	}
 	select {
 	case <-ctx.Done():
@@ -182,20 +182,22 @@ func TestCaptureValue(t *testing.T) {
 
 func TestCaptureValues(t *testing.T) {
 	testSetup(t)
-	i, err := CaptureValues(func() (int, error) {
+	i, err, panicked := CaptureValues(func() (int, error) {
 		return 1, testErr
 	})
-	if i != 1 || err != testErr {
-		t.Errorf("CaptureValues() = %d, %v; want: %d, %v", i, err, 1, testErr)
+	if i != 1 || err != testErr || panicked {
+		t.Errorf("CaptureValues() = %d, %v, %t; want: %d, %v, %t",
+			i, err, panicked, 1, testErr, false)
 	}
 	ctx, cancel := NotifyContext(context.Background())
 	defer cancel()
-	j, err := CaptureValues(func() (int, error) {
+	j, err, panicked := CaptureValues(func() (int, error) {
 		panic("here")
 		// unreachable
 	})
-	if j != 0 || err != nil {
-		t.Errorf("CaptureValues() = %d, %v; want: %d, %v", j, err, 0, nil)
+	if j != 0 || err != nil || !panicked {
+		t.Errorf("CaptureValues() = %d, %v, %t; want: %d, %v, %t",
+			j, err, panicked, 0, nil, true)
 	}
 	select {
 	case <-ctx.Done():

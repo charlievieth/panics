@@ -100,56 +100,6 @@ func ExampleCapture_waitGroup() {
 	// canceled
 }
 
-func ExampleCaptureValue() {
-	panics.SetPrintStackTrace(false) // quiet output
-
-	ch := make(chan *panics.Error, 1)
-	panics.Notify(ch)
-
-	i, panicked := panics.CaptureValue(func() int {
-		return 1
-	})
-	fmt.Printf("i: %d panicked: %t\n", i, panicked)
-
-	// Output:
-	// i: 1 panicked: false
-}
-
-// TODO: fix the interface so that this does not suck
-//
-// func ExampleCaptureValue_panic() {
-// 	panics.SetPrintStackTrace(false) // quiet output
-//
-// 	ch := make(chan *panics.Error, 1)
-// 	panics.Notify(ch)
-//
-// 	// WARN: this is not very ergonomic because it's hard to
-// 	// tell if fn() panicked which could lead to use using a
-// 	// nil value and triggering another panic !!!
-// 	i := panics.CaptureValue(func() *int {
-// 		panic("my panic")
-// 	})
-// 	fmt.Println(i)
-//
-// 	// Output:
-// 	// FIXME
-// }
-
-func ExampleCaptureValues() {
-	panics.SetPrintStackTrace(false) // quiet output
-
-	ch := make(chan *panics.Error, 1)
-	panics.Notify(ch)
-
-	i, err, panicked := panics.CaptureValues(func() (int, error) {
-		return 1, nil
-	})
-	fmt.Println(i, err, panicked)
-
-	// Output:
-	// 1 <nil> false
-}
-
 func ExampleGoWG() {
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {

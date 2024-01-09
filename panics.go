@@ -511,33 +511,6 @@ func Capture(fn func()) (_panicked bool) {
 	return _panicked
 }
 
-// TODO: delete CaptureValue and CaptureValues since we should only be using
-// this package to recover goroutines and these don't support that and make the
-// ergonomics of this package odd.
-
-// CaptureValues invokes fn and returns the value returned by fn and a bool
-// indicating if fn panicked. Any panic that occurs during the execution of
-// fn will be safely recovered from by [Capture].
-func CaptureValue[T any](fn func() T) (v T, panicked bool) {
-	panicked = Capture(func() { v = fn() })
-	return v, panicked
-}
-
-// CaptureValues invokes fn and returns the values returned by fn and a bool
-// indicating if fn panicked. Any panic that occurs during the execution of
-// fn will be safely recovered from by [Capture].
-func CaptureValues[T1, T2 any](fn func() (T1, T2)) (v1 T1, v2 T2, panicked bool) {
-	panicked = Capture(func() { v1, v2 = fn() })
-	return v1, v2, panicked
-}
-
-func CaptureValuesX[T1, T2 any](fn func() (T1, T2)) (v1 T1, v2 T2, panicked bool) {
-	panicked = Capture(func() {
-		v1, v2 = fn()
-	})
-	return v1, v2, panicked
-}
-
 // Go runs func fn in a goroutine using [Capture].
 //
 // Note: Deferred functions in fn are called before the panic handler (see

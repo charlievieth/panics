@@ -154,60 +154,6 @@ func TestGoWGNilWaitGroup(t *testing.T) {
 	GoWG(nil, func() {})
 }
 
-func TestCaptureValue(t *testing.T) {
-	testSetup(t)
-	i, didPanic := CaptureValue(func() int {
-		return 1
-	})
-	if i != 1 || didPanic {
-		t.Errorf("CaptureValue() = %d, %t; want: %d, %t", i, didPanic, 1, false)
-	}
-	ctx, cancel := NotifyContext(context.Background())
-	defer cancel()
-	j, didPanic := CaptureValue(func() int {
-		panic("here")
-		// unreachable
-	})
-	if j != 0 || !didPanic {
-		t.Errorf("CaptureValue() = %d, %t; want: %d, %t", j, didPanic, 0, true)
-	}
-	select {
-	case <-ctx.Done():
-		// Ok
-	default:
-		// WARN: remove time.After
-		t.Fatal("panic did not cancel Context")
-	}
-}
-
-func TestCaptureValues(t *testing.T) {
-	testSetup(t)
-	i, err, panicked := CaptureValues(func() (int, error) {
-		return 1, testErr
-	})
-	if i != 1 || err != testErr || panicked {
-		t.Errorf("CaptureValues() = %d, %v, %t; want: %d, %v, %t",
-			i, err, panicked, 1, testErr, false)
-	}
-	ctx, cancel := NotifyContext(context.Background())
-	defer cancel()
-	j, err, panicked := CaptureValues(func() (int, error) {
-		panic("here")
-		// unreachable
-	})
-	if j != 0 || err != nil || !panicked {
-		t.Errorf("CaptureValues() = %d, %v, %t; want: %d, %v, %t",
-			j, err, panicked, 0, nil, true)
-	}
-	select {
-	case <-ctx.Done():
-		// Ok
-	default:
-		// WARN: remove time.After
-		t.Fatal("panic did not cancel Context")
-	}
-}
-
 // WARN: rename
 func WaitFor(ch <-chan *Error) <-chan *Error {
 	// Can't wait for un-buffered channels.

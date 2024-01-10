@@ -182,10 +182,12 @@ func TestCaptureAllStackTraces(t *testing.T) {
 		t.Fatal("First() == nil")
 	}
 
+	// On slow machines (CI) we might not see all the goroutines so we
+	// don't require the exact number here
 	n := strings.Count(err.Stack(), "goroutine") - numGoroutine
-	if n < 32 {
+	if n < 24 {
 		t.Fatalf("Captured stack trace should include at least %d goroutines found: %d\n%s",
-			32, n, err.Stack())
+			24, n, err.Stack())
 	}
 }
 

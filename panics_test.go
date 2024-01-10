@@ -170,8 +170,6 @@ func TestCapturePanicError(t *testing.T) {
 
 func TestCaptureAllStackTraces(t *testing.T) {
 	testSetup(t)
-	var buf bytes.Buffer
-	SetOutput(&buf)
 	IncludeAllStackTraces(true)
 
 	numGoroutine := runtime.NumGoroutine()

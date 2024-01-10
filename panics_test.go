@@ -994,9 +994,7 @@ func TestErrorUnwrap(t *testing.T) {
 func BenchmarkCapture(b *testing.B) {
 	testSetup(b)
 	for i := 0; i < b.N; i++ {
-		Capture(func() {
-			return
-		})
+		Capture(func() {})
 	}
 }
 

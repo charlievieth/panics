@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -59,7 +60,10 @@ func resetHandlers(t testing.TB) {
 	handlers.stoppingCtx = nil
 
 	firstPanic.Store(nil)
-	panicked.Store(false)
+	panicCount.Store(0)
+
+	SetOutput(nil)
+	IncludeAllStackTraces(false)
 }
 
 func testSetup(t testing.TB) {
@@ -82,10 +86,9 @@ func testSetup(t testing.TB) {
 			t.Errorf("leaked %d goroutines", n-goroutines)
 		}
 	})
-	SetOutput(nil)
+
 	resetHandlers(t)
 	t.Cleanup(func() {
-		SetOutput(os.Stderr)
 		resetHandlers(t)
 	})
 }
@@ -154,7 +157,42 @@ func TestGoWGNilWaitGroup(t *testing.T) {
 	GoWG(nil, func() {})
 }
 
-// WARN: rename
+func TestCapturePanicError(t *testing.T) {
+	testSetup(t)
+	err := Capture(func() { panic(testErr) }).(*Error)
+	if !reflect.DeepEqual(err.Value(), testErr) {
+		t.Errorf("Value() = %v; want: %v", err, testErr)
+	}
+	if err.ID() != 1 {
+		t.Errorf("ID() = %d; want: %d", err.ID(), 1)
+	}
+}
+
+func TestCaptureAllStackTraces(t *testing.T) {
+	testSetup(t)
+	var buf bytes.Buffer
+	SetOutput(&buf)
+	IncludeAllStackTraces(true)
+
+	numGoroutine := runtime.NumGoroutine()
+	wg, start := generatePanics(t, 32, 1, testErr)
+	start()
+
+	wg.Wait()
+	err := First()
+	if err == nil {
+		t.Fatal("First() == nil")
+	}
+
+	n := strings.Count(err.Stack(), "goroutine") - numGoroutine
+	if n < 32 {
+		t.Fatalf("Captured stack trace should include at least %d goroutines found: %d\n%s",
+			32, n, err.Stack())
+	}
+}
+
+// TODO: export ???
+// TODO: rename
 func WaitFor(ch <-chan *Error) <-chan *Error {
 	// Can't wait for un-buffered channels.
 	if len(ch) == 0 && cap(ch) > 0 {
@@ -206,6 +244,19 @@ func TestCapturePanicNilFunc(t *testing.T) {
 		t.Errorf("expected runtime.Error got: %T", err)
 	}
 }
+
+// func TestNestedCapture(t *testing.T) {
+// 	t.Skip("FIXME")
+// 	testSetup(t)
+// 	panicked := Capture(func() {
+// 		Capture(func() {
+// 			panic(testErr)
+// 		})
+// 	})
+// 	if !panicked {
+// 		t.Fatal("WAT:", panicked)
+// 	}
+// }
 
 func TestCaptureAllocs(t *testing.T) {
 	testSetup(t)
@@ -714,7 +765,7 @@ func TestNotifyContextStop(t *testing.T) {
 	defer cancel()
 
 	start()
-	for !panicked.Load() {
+	for panicCount.Load() == 0 {
 	}
 	cancel()
 	e := ContextError(ctx)
@@ -728,8 +779,7 @@ func TestNotifyContextStop(t *testing.T) {
 
 	// TODO: It would be nice if we could do this, but that
 	// might be too difficult to be worth it.
-	if e.Recovered() {
-		// t.Fatal("Context not canceled with the first Error")
+	if !e.First() {
 		t.Log("TODO: Context not canceled with the first Error")
 	}
 
@@ -753,7 +803,7 @@ func TestFirstPanic(t *testing.T) {
 	var e *Error
 	for {
 		// If panicking make sure First waits until firstPanic is set.
-		if panicked.Load() && First() == nil {
+		if panicCount.Load() != 0 && First() == nil {
 			t.Fatal("First returned nil despite a panic being actively processed")
 		}
 		if e = First(); e != nil {
@@ -765,8 +815,8 @@ func TestFirstPanic(t *testing.T) {
 	if ee := First(); ee != e {
 		t.Fatalf("overwrote first panic: (%[1]p)%[1]v with: (%[2]p)%[2]v", e, ee)
 	}
-	if e.Recovered() {
-		t.Errorf("Recovered() = %t; want: %t", true, false)
+	if !e.First() {
+		t.Errorf("First() = %t; want: %t", false, true)
 	}
 	if e.Value() != want {
 		t.Errorf("Value() = %v; want: %v", e.Value(), want)
@@ -788,7 +838,7 @@ func TestFirstPanicHard(t *testing.T) {
 			var u atomic.Uint32
 			for i := 0; i < 100; i++ {
 				firstPanic.Store(nil)
-				panicked.Store(false)
+				panicCount.Store(0)
 				u.Store(0)
 				wg, start := createGoroutines(t, num, func() {
 					panic(u.Swap(1))
@@ -940,6 +990,15 @@ func TestErrorUnwrap(t *testing.T) {
 		if got != test.want {
 			t.Errorf("%+v.Unwrap() = %v; want: %v", test.err, got, test.want)
 		}
+	}
+}
+
+func BenchmarkCapture(b *testing.B) {
+	testSetup(b)
+	for i := 0; i < b.N; i++ {
+		Capture(func() {
+			return
+		})
 	}
 }
 

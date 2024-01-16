@@ -917,6 +917,18 @@ func TestSetOutputNilWriter(t *testing.T) {
 	fmt.Fprintln(output.Load(), "DO NOT PANIC")
 }
 
+func TestWriteTimeout(t *testing.T) {
+	testSetup(t)
+
+	if writeTimeout.Load() != int64(100*time.Millisecond) {
+		t.Errorf("Expected default to be set to 100ms, but got %d.", time.Duration(writeTimeout.Load()))
+	}
+	WriteTimeout(90 * time.Millisecond)
+	if writeTimeout.Load() != int64(90*time.Millisecond) {
+		t.Errorf("Expected default to be set to 90ms, but got %d.", time.Duration(writeTimeout.Load()))
+	}
+}
+
 func TestSetOutputPanickingWriter(t *testing.T) {
 	testSetup(t)
 

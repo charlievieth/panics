@@ -20,18 +20,10 @@ import (
 //
 // 	* Add an internal Error logger to report write errors, timeouts, or
 // 	  any other error that we can't directly surface to the user
-// 	* Make WriteTimeout configurable
 
 // Explain the reasoning behind NotifyContext, which provides a context
 // that is cancelled on any panic. If propagated then this will cancel
 // any inflight requests/work helping to prepare for exit.
-
-// WriteTimeout is the maximum amount of time to wait for a panic to be written
-// to output before handling the panic and signalling any registered channels
-// or canceling any registered contexts.
-//
-// This prevents a slow or blocked writer from blocking the handling of panics.
-const WriteTimeout = 100 * time.Millisecond
 
 var (
 	noPrintTrace   atomic.Bool
@@ -40,6 +32,7 @@ var (
 	delivering     atomic.Int32  // panics being actively handled/delivered
 	firstPanic     atomic.Pointer[Error]
 	output         atomic.Pointer[writer]
+	writeTimeout   atomic.Int64
 )
 
 var stderrWriter = writer{w: os.Stderr}
@@ -47,6 +40,8 @@ var stderrWriter = writer{w: os.Stderr}
 // immediately initialize output before any init() functions run
 var _ = func() struct{} {
 	output.Store(&stderrWriter)
+	// Initialize writeTimeout default to 100ms
+	writeTimeout.Store(int64(100 * time.Millisecond))
 	return struct{}{}
 }()
 
@@ -72,8 +67,8 @@ func (w *writer) Write(p []byte) (int, error) {
 // uncaught panic. The Writer must be safe for concurrent use. By default,
 // panics are written to [os.Stderr].
 //
-// If writing the panic takes more that [WriteTimeout] all registered channels
-// and contexts will be notified / canceled before the write completes.
+// If writing the panic takes more than the timeout (configurable via the [WriteTimeout] function)
+// all registered channels and contexts will be notified / canceled before the write completes.
 //
 // Calling SetOutput with a nil [io.Writer] or calling [PrintStackTrace] with
 // false disables the printing of panics.
@@ -117,6 +112,15 @@ func PrintStackTrace(printTrace bool) (prev bool) {
 // included can be quite large (I've seen +30MB on large services).
 func IncludeAllStackTraces(allTraces bool) (prev bool) {
 	return allStackTraces.Swap(allTraces)
+}
+
+// WriteTimeout sets the maximum amount of time to wait for a panic to be written
+// to output before handling the panic and signalling any registered channels
+// or canceling any registered contexts.
+//
+// This prevents a slow or blocked writer from blocking the handling of panics.
+func WriteTimeout(timeout time.Duration) (prev time.Duration) {
+	return time.Duration(writeTimeout.Swap(int64(timeout)))
 }
 
 // A Error is an arbitrary value recovered from a panic
@@ -465,9 +469,9 @@ func handlePanic(e *Error, timeout time.Duration) {
 //
 // If stack trace printing is enabled via [PrintStackTrace] (default true),
 // the panic and its stack trace are immediately written to the writer configured
-// by [SetOutput] (default [os.Stderr]) in the same format as Go writes an
-// unhandled panic. The panics package will wait up [WriteTimeout] for the write
-// to finish before notifying any registered channels or Contexts of the panic
+// by [SetOutput] (default [os.Stderr]) in the same format as Go writes an unhandled panic. The
+// panics package will wait up to a specified timeout (configurable via the [WriteTimeout] function)
+// for the write to finish before notifying any registered channels or Contexts of the panic
 // (otherwise a blocked writer will prevent panic handling/notification).
 // Therefore, programs should not rely on this behavior alone to print the panic
 // and its stack trace before exit. Instead, programs should ensure that they
@@ -530,7 +534,7 @@ func Capture(fn func()) (panicErr error) {
 			if id == 1 {
 				firstPanic.Store(err)
 			}
-			handlePanic(err, WriteTimeout)
+			handlePanic(err, time.Duration(writeTimeout.Load()))
 
 			panicErr = err
 		}

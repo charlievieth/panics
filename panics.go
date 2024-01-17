@@ -451,7 +451,6 @@ func handlePanic(e *Error, timeout time.Duration) {
 	}
 
 	// If logging is enabled, do not indefinitely block on it.
-	done := make(chan struct{})
 	writeErrorFn := func(wr *writer, done chan<- struct{}) {
 		defer func() {
 			if done != nil {
@@ -463,6 +462,7 @@ func handlePanic(e *Error, timeout time.Duration) {
 	}
 
 	if timeout > 0 {
+		done := make(chan struct{})
 		go writeErrorFn(wr, done)
 		to := time.NewTimer(timeout)
 		select {

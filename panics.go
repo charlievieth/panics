@@ -25,6 +25,7 @@ import (
 // that is cancelled on any panic. If propagated then this will cancel
 // any inflight requests/work helping to prepare for exit.
 
+// DefaultWriteTimeout is the default value of writeTimeout.
 const DefaultWriteTimeout = 500 * time.Millisecond
 
 var (
@@ -118,8 +119,8 @@ func IncludeAllStackTraces(allTraces bool) (prev bool) {
 
 // WriteTimeout sets the maximum amount of time to wait for a panic to be written
 // to output before handling the panic and signalling any registered channels
-// or canceling any registered contexts. If `timeout` is <= 0,we'll wait indefinitely
-// until panic is written to output.
+// or canceling any registered contexts. A non-positive timeout (<= 0) disables
+// the write timeout.
 //
 // This prevents a slow or blocked writer from blocking the handling of panics.
 func WriteTimeout(timeout time.Duration) (prev time.Duration) {
@@ -451,15 +452,18 @@ func handlePanic(e *Error, timeout time.Duration) {
 
 	// If logging is enabled, do not indefinitely block on it.
 	done := make(chan struct{})
-	go func(wr *writer, done chan<- struct{}) {
+	writeErrorFn := func(wr *writer, done chan<- struct{}) {
 		defer func() {
-			close(done)
+			if done != nil {
+				close(done)
+			}
 			_ = recover() // ignore panic
 		}()
 		_, _ = e.WriteTo(wr) // ignore error
-	}(wr, done)
+	}
 
 	if timeout > 0 {
+		go writeErrorFn(wr, done)
 		to := time.NewTimer(timeout)
 		select {
 		case <-to.C:
@@ -467,6 +471,8 @@ func handlePanic(e *Error, timeout time.Duration) {
 		case <-done:
 			to.Stop()
 		}
+	} else {
+		writeErrorFn(wr, nil)
 	}
 }
 

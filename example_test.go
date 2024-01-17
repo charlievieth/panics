@@ -252,7 +252,7 @@ func Example_correctUsage() {
 	// handle unhandled panics generally - and that is to immediately initiate
 	// program termination.
 
-	// Disable for the example since it polutes the output.
+	// Disable for the example since it pollutes the output.
 	panics.PrintStackTrace(false)
 
 	// The context created by panics.NotifyContext should be the parent of

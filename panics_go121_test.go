@@ -15,7 +15,7 @@ func TestNotifyContextWithoutCancel(t *testing.T) {
 		parent, cancel1 := NotifyContext(context.Background())
 		defer cancel1()
 
-		// If the parent is already registed we don't register the child
+		// If the parent is already registered we don't register the child
 		// (since the parent will cancel it), WithoutCancel breaks this
 		// so test that we handle it.
 		ctx, cancel2 := NotifyContext(context.WithoutCancel(parent))

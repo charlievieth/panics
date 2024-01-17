@@ -1,0 +1,29 @@
+---
+run:
+linters:
+  enable:
+    - gocritic
+    - gofmt
+    - goimports
+    - gosec
+    - mirror
+    - misspell
+    - unconvert
+    - wastedassign
+output:
+  sort-results: true
+issues:
+  exclude-rules:
+    - path: \.go
+      linters:
+        - errcheck
+      source: '\bCapture\('
+    - path: panics_test.go
+      linters:
+        - staticcheck
+      text: 'SA1012: do not pass a nil Context'
+    - path: example_test.go
+      linters:
+        - errcheck
+      source: '\.WriteTo\('
+  fix: false

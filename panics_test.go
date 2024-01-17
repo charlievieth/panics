@@ -920,7 +920,7 @@ func TestSetOutputNilWriter(t *testing.T) {
 func TestWriteTimeout(t *testing.T) {
 	testSetup(t)
 
-	if writeTimeout.Load() != int64(100*time.Millisecond) {
+	if writeTimeout.Load() != int64(500*time.Millisecond) {
 		t.Errorf("Expected default writeTimeout to be set to 100ms, but got %d.", time.Duration(writeTimeout.Load()))
 	}
 	WriteTimeout(90 * time.Millisecond)

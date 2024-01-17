@@ -826,10 +826,10 @@ func TestFirstPanic(t *testing.T) {
 // TODO: rename
 func TestFirstPanicHard(t *testing.T) {
 	// Stress test how often the panic returned by First is actually
-	// the first panic that occured. We don't control the runtime so
+	// the first panic that occurred. We don't control the runtime so
 	// if multiple panics occur at the exact same time the first
 	// panic that we handle might not be exactly the first one that
-	// occured.
+	// occurred.
 
 	test := func(t *testing.T, num int) {
 		t.Run(fmt.Sprintf("%d", num), func(t *testing.T) {

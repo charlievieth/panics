@@ -62,6 +62,7 @@ func resetHandlers(t testing.TB) {
 	firstPanic.Store(nil)
 	panicCount.Store(0)
 
+	WriteTimeout(DefaultWriteTimeout)
 	SetOutput(nil)
 	IncludeAllStackTraces(false)
 }
@@ -1038,4 +1039,58 @@ func BenchmarkNotifyContext(b *testing.B) {
 			f()
 		}
 	})
+}
+
+func TestHandlePanicNoWriteTimeout(t *testing.T) {
+	testSetup(t)
+
+	const delay = 10 * time.Millisecond
+
+	WriteTimeout(-1) // Wait for the write to complete
+
+	ops := make(chan string, 4)
+	SetOutput(WriterFunc(func(p []byte) {
+		ops <- "write: start"
+		time.Sleep(delay)
+		ops <- "write: complete"
+	}))
+
+	ch := testNotify(t)
+	go func() {
+		defer func() {
+			ops <- "capture: complete"
+			close(ops)
+		}()
+		Capture(func() {
+			ops <- "capture: start"
+			panic(testErr)
+		})
+	}()
+
+	start := time.Now()
+	select {
+	case <-ch:
+		if d := time.Since(start); d < delay {
+			t.Fatalf("Capture returned before write completed: %s", d)
+		}
+	case now := <-time.After(delay * 5):
+		t.Fatal("timed out after:", now.Sub(start))
+	}
+
+	want := []string{
+		"capture: start",
+		"write: start",
+		"write: complete",
+		"capture: complete",
+	}
+	var got []string
+	if n := len(ops); n != len(want) {
+		t.Fatalf("expected %d ops; got: %d", len(want), n)
+	}
+	for s := range ops {
+		got = append(got, s)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("invalid order of ops: %q; want: %q", got, want)
+	}
 }

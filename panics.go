@@ -25,7 +25,7 @@ import (
 // that is cancelled on any panic. If propagated then this will cancel
 // any inflight requests/work helping to prepare for exit.
 
-// DefaultWriteTimeout is the default value of writeTimeout.
+// DefaultWriteTimeout is the default value of [WriteTimeout].
 const DefaultWriteTimeout = 500 * time.Millisecond
 
 var (
@@ -471,9 +471,9 @@ func handlePanic(e *Error, timeout time.Duration) {
 		case <-done:
 			to.Stop()
 		}
-	} else {
-		writeErrorFn(wr, nil)
+		return
 	}
+	writeErrorFn(wr, nil)
 }
 
 // Capture calls function fn directly, not in a goroutine, safely recovers
